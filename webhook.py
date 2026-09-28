@@ -10,6 +10,8 @@ from typing import Any, Mapping
 
 from gateway.platforms.helpers import MessageDeduplicator
 
+from .runtime import parse_recall_chat_event
+
 MAX_BODY_BYTES = 64 * 1024
 ACCEPTED_EVENT = "participant_events.chat_message"
 
@@ -91,7 +93,21 @@ class RecallWebhookReceiver:
         if event_type != ACCEPTED_EVENT:
             return WebhookAdmission(204, "")
         payload["webhook_id"] = wid
+        try:
+            candidate = parse_recall_chat_event(payload)
+        except ValueError as exc:
+            return WebhookAdmission(400, str(exc))
         async with self.runtime.admission_lock:
+            active = self.runtime.active
+            if (
+                not self.runtime.accepting_callbacks
+                or self.runtime.shutting_down
+                or active is None
+                or not active.bot_id
+                or candidate.bot_id != active.bot_id
+                or candidate.recipient != "only_bot"
+            ):
+                return WebhookAdmission(204, "")
             if self.dedup.contains(wid):
                 return WebhookAdmission(204, "")
             try:

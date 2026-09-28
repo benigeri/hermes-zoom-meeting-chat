@@ -27,6 +27,9 @@ async def test_hmac_admission_dedup_and_queue_full():
         config=SimpleNamespace(webhook_secret="whsec_dGVzdA", webhook_replay_window_seconds=300),
         queue=asyncio.Queue(maxsize=1),
         admission_lock=asyncio.Lock(),
+        active=SimpleNamespace(bot_id="bot-1"),
+        accepting_callbacks=True,
+        shutting_down=False,
     )
     receiver = wh.RecallWebhookReceiver(runtime)
     now = int(time.time())
@@ -44,6 +47,41 @@ async def test_hmac_admission_dedup_and_queue_full():
     assert bad.status == 405
     stale = await receiver.admit(method="POST", content_type="application/json", headers=signed(runtime.config.webhook_secret, "evt-old", now - 9999, body), raw_body=body)
     assert stale.status == 400
+
+
+@pytest.mark.asyncio
+async def test_signed_irrelevant_or_malformed_events_never_consume_queue_or_dedup():
+    load_plugin_pkg("zoom_webhook_reject_pkg")
+    wh = __import__("zoom_webhook_reject_pkg.webhook", fromlist=["RecallWebhookReceiver"])
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(webhook_secret="whsec_dGVzdA", webhook_replay_window_seconds=300),
+        queue=asyncio.Queue(maxsize=2),
+        admission_lock=asyncio.Lock(),
+        active=SimpleNamespace(bot_id="bot-1"),
+        accepting_callbacks=True,
+        shutting_down=False,
+    )
+    receiver = wh.RecallWebhookReceiver(runtime)
+    now = int(time.time())
+
+    def body_for(*, bot="bot-1", participant=7, text="hi", to="only_bot"):
+        return json.dumps({"event": "participant_events.chat_message", "data": {"data": {"participant": {"id": participant, "name": "Paul"}, "timestamp": {"absolute": "2026-09-28T00:00:00Z", "relative": 1.0}, "data": {"text": text, "to": to}}, "bot": {"id": bot}}}).encode()
+
+    for wid, body, expected in (
+        ("public", body_for(to="everyone"), 204),
+        ("wrong-bot", body_for(bot="bot-2"), 204),
+        ("missing-participant", body_for(participant=""), 400),
+        ("overlong", body_for(text="x" * 4001), 400),
+    ):
+        result = await receiver.admit(method="POST", content_type="application/json", headers=signed(runtime.config.webhook_secret, wid, now, body), raw_body=body)
+        assert result.status == expected
+        assert runtime.queue.qsize() == 0
+        assert not receiver.dedup.contains(wid)
+
+    valid = body_for()
+    accepted = await receiver.admit(method="POST", content_type="application/json", headers=signed(runtime.config.webhook_secret, "valid", now, valid), raw_body=valid)
+    assert accepted.status == 202
+    assert runtime.queue.qsize() == 1
 
 
 def test_compatibility_preflight_success_and_failures(monkeypatch):

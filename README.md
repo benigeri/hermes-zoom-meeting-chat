@@ -11,6 +11,8 @@ Standalone Hermes platform plugin for a narrow v0.1 Zoom meeting-chat flow backe
 
 The plugin stays inert unless explicitly enabled and configured with Recall credentials plus a public HTTPS callback URL.
 
+**Status:** API-contract and local integration tests pass. A credentialed Recall/Zoom acceptance test has not yet run, so this release is experimental and not verified for production meetings.
+
 ## Files
 
 - `plugin.yaml` — native Hermes platform manifest; declares the three management tools.
@@ -62,6 +64,8 @@ RECALL_WEBHOOK_SECRET=whsec_...
 
 `RECALL_WEBHOOK_SECRET` must be the Recall workspace signing secret and must begin with `whsec_`. Unsigned callbacks and URL-token fallback are intentionally unsupported.
 
+`callback_bind_host` must remain loopback (`127.0.0.1`, `localhost`, or `::1`). Put HTTPS and public exposure in a reverse proxy or tunnel whose proxy-to-plugin hop is local or authenticated and encrypted. Suppress webhook bodies and secrets in proxy access/error logs.
+
 ## Operation
 
 1. From a trusted Hermes surface, call `zoom_chat_join(meeting_url)`.
@@ -70,6 +74,8 @@ RECALL_WEBHOOK_SECRET=whsec_...
 4. After pairing, only that immutable Zoom participant ID can trigger Hermes.
 5. Replies are sent only to the exact live DM route `meeting:{bot_id}:dm:{participant_id}`.
 6. Use `zoom_chat_leave` to leave. If create/leave is uncertain, check Recall before rejoining.
+
+An uncertain create or leave blocks another join in the running gateway. The plugin does not retry ambiguous mutations. Confirm the bot's state in Recall before restarting the gateway or otherwise resetting this in-memory safety state.
 
 ## Safety boundaries
 

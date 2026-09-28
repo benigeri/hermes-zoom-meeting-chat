@@ -62,6 +62,8 @@ class ZoomChatConfig:
         if public and urlsplit(public).scheme != "https":
             raise ValueError("callback_public_base_url must be HTTPS")
         host = str(_extra(extra, "callback_bind_host", "127.0.0.1")).strip() or "127.0.0.1"
+        if host.lower() not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("callback_bind_host must be loopback (127.0.0.1, localhost, or ::1)")
         return cls(
             api_key=_secret("RECALL_API_KEY"),
             webhook_secret=_secret("RECALL_WEBHOOK_SECRET"),

@@ -3,7 +3,7 @@ label: Zoom Meeting Chat
 kind: platform
 version: 0.1.0
 description: DM-only Recall.ai-backed Zoom meeting chat platform for Hermes.
-author: Nous Research / Hermes Agent
+author: Paul Benigeri
 license: MIT
 requires_env:
   - name: RECALL_API_KEY

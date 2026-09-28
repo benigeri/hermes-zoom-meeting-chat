@@ -21,6 +21,7 @@ class FakeTransport:
         self.requests = []
         self.create_response = {"id": "bot-1", "participant_id": "hio-1"}
         self.raise_on_create = None
+        self.raise_on_leave = None
 
     async def request(self, method, url, *, headers, json_body=None, timeout=20.0):
         self.requests.append((method, url, json_body))
@@ -31,6 +32,8 @@ class FakeTransport:
         if url.endswith("/send_chat_message/"):
             return {"id": "msg-out", "sent": True}
         if url.endswith("/leave_call/"):
+            if self.raise_on_leave:
+                raise self.raise_on_leave
             return {"left": True}
         return {}
 
@@ -158,3 +161,27 @@ async def test_uncertain_create_blocks_retry(runtime):
     again = await rt.join("https://example.zoom.us/j/123")
     assert again["duplicate"] is True
     assert len([r for r in transport.requests if r[1].endswith("/api/v1/bot/")]) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_leave_keeps_uncertain_state_and_blocks_second_join(runtime):
+    rt, transport, _adapter = runtime
+    joined = await rt.join("https://example.zoom.us/j/123")
+    assert joined["ok"] is True
+    transport.raise_on_leave = TimeoutError("network")
+    left = await rt.leave()
+    assert left["ok"] is False and left["uncertain"] is True
+    assert rt.active is not None and rt.active.uncertain is True
+    again = await rt.join("https://example.zoom.us/j/456")
+    assert again["ok"] is False
+    assert len([r for r in transport.requests if r[1].endswith("/api/v1/bot/")]) == 1
+
+
+@pytest.mark.asyncio
+async def test_pairing_phrase_is_revealed_only_once(runtime):
+    rt, _transport, _adapter = runtime
+    first = await rt.join("https://example.zoom.us/j/123")
+    assert first.get("pairing_phrase")
+    duplicate = await rt.join("https://example.zoom.us/j/123")
+    assert duplicate["duplicate"] is True
+    assert "pairing_phrase" not in duplicate

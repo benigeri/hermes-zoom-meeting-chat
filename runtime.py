@@ -23,6 +23,7 @@ class ActiveMeeting:
     generation: int
     pairing_phrase: str
     pairing_expires_at: float
+    phrase_revealed: bool = False
     bot_id: str | None = None
     bot_participant_id: str | None = None
     operator_participant_id: str | None = None
@@ -36,6 +37,47 @@ class ActiveMeeting:
 
 
 _RUNTIMES: dict[str, "ZoomChatRuntime"] = {}
+
+
+@dataclass(frozen=True)
+class RecallChatEvent:
+    bot_id: str
+    participant_id: str
+    participant_name: str
+    text: str
+    recipient: str
+    message_id: str
+
+
+def parse_recall_chat_event(event: dict[str, Any]) -> RecallChatEvent:
+    """Parse Recall's documented real-time chat envelope, failing closed."""
+    envelope_value = event.get("data")
+    if not isinstance(envelope_value, dict):
+        raise ValueError("missing data envelope")
+    chat_value = envelope_value.get("data")
+    if not isinstance(chat_value, dict):
+        raise ValueError("missing chat event data")
+    participant_value = chat_value.get("participant")
+    message_value = chat_value.get("data")
+    bot_value = envelope_value.get("bot")
+    if not isinstance(participant_value, dict) or not isinstance(message_value, dict) or not isinstance(bot_value, dict):
+        raise ValueError("malformed chat event")
+    bot_id = str(bot_value.get("id") or "").strip()
+    participant_id = str(participant_value.get("id") or "").strip()
+    participant_name = str(participant_value.get("name") or "")
+    text = str(message_value.get("text") or "")
+    recipient = str(message_value.get("to") or "").strip().lower()
+    message_id = str(event.get("webhook_id") or "").strip()
+    if not bot_id or not participant_id or not message_id or not recipient or not text or len(text) > 4000:
+        raise ValueError("incomplete or oversized chat event")
+    return RecallChatEvent(
+        bot_id=bot_id,
+        participant_id=participant_id,
+        participant_name=participant_name,
+        text=text,
+        recipient=recipient,
+        message_id=message_id,
+    )
 
 
 def _current_home_key() -> str:
@@ -147,7 +189,7 @@ class ZoomChatRuntime:
             "generation": m.generation,
             "pairing_expires_at": m.pairing_expires_at,
         }
-        if include_phrase:
+        if include_phrase and not m.phrase_revealed:
             out["pairing_phrase"] = m.pairing_phrase
         return out
 
@@ -164,11 +206,12 @@ class ZoomChatRuntime:
                 return {"ok": False, "error": "gateway adapter is shutting down"}
             if self.active:
                 if self.active.meeting_fingerprint == fp:
-                    out = self._status_dict(include_phrase=not self.active.paired)
+                    out = self._status_dict(include_phrase=False)
                     out["duplicate"] = True
                     return out
                 return {"ok": False, "error": "one Zoom meeting is already active or uncertain"}
             self.generation += 1
+            self.accepting_callbacks = True
             phrase = secrets.token_urlsafe(18)
             self.active = ActiveMeeting(
                 meeting_url=clean_url,
@@ -187,6 +230,7 @@ class ZoomChatRuntime:
                 self.active.bot_id = bot_id
                 self.active.bot_participant_id = str(resp.get("participant_id") or resp.get("bot_participant_id") or "").strip() or None
                 out = self._status_dict(include_phrase=True)
+                self.active.phrase_revealed = True
                 out["ok"] = True
                 out["pairing_instructions"] = "Send pairing_phrase as a direct Zoom message to Hio within 10 minutes. It is shown only in this tool result."
                 return out
@@ -202,12 +246,13 @@ class ZoomChatRuntime:
                 return {"ok": True, "active": False, "left": False}
             self.accepting_callbacks = False
             self.chat_routes.clear()
-            self.active = None
             if m.bot_id and not m.uncertain:
                 try:
                     await self.client.leave_bot(m.bot_id)
+                    self.active = None
                     return {"ok": True, "left": True, "bot_id": m.bot_id}
                 except Exception as exc:
+                    m.uncertain = True
                     return {"ok": False, "left": False, "uncertain": True, "error": f"leave failed: {type(exc).__name__}"}
             return {"ok": False, "left": False, "uncertain": True, "error": "active bot id is unknown or uncertain; check Recall dashboard"}
 
@@ -281,29 +326,23 @@ class ZoomChatRuntime:
         )
 
     async def process_callback_event(self, event: dict[str, Any]) -> Any | None:
-        # Recall's real-time envelope is data -> data ->
-        # {participant, timestamp, data: {text, to}}.  ``to`` is exactly
-        # ``only_bot`` for a DM and ``everyone`` for public chat.  Do not infer
-        # DM from a missing field.
-        envelope = event.get("data") if isinstance(event.get("data"), dict) else {}
-        chat_event = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
-        participant = chat_event.get("participant") if isinstance(chat_event.get("participant"), dict) else {}
-        message = chat_event.get("data") if isinstance(chat_event.get("data"), dict) else {}
-        text = str(message.get("text") or "")
-        recipient = str(message.get("to") or "").lower()
-        participant_id = str(participant.get("id") or "")
-        participant_name = str(participant.get("name") or "")
-        message_id = str(event.get("webhook_id") or "")
-        bot = envelope.get("bot") if isinstance(envelope.get("bot"), dict) else {}
-        bot_id = str(bot.get("id") or "")
+        try:
+            candidate = parse_recall_chat_event(event)
+        except ValueError:
+            return None
         m = self.active
         if not self.accepting_callbacks or not m or not m.bot_id:
             return None
-        if not bot_id or bot_id != m.bot_id:
+        if candidate.bot_id != m.bot_id:
             return None
-        if recipient != "only_bot" or not text or len(text) > 4000 or not participant_id or not message_id:
+        if candidate.recipient != "only_bot":
             return None
-        return self.build_operator_event(text=text, participant_id=participant_id, participant_name=participant_name, message_id=message_id)
+        return self.build_operator_event(
+            text=candidate.text,
+            participant_id=candidate.participant_id,
+            participant_name=candidate.participant_name,
+            message_id=candidate.message_id,
+        )
 
     async def consumer_once(self) -> Any | None:
         item = await self.queue.get()
