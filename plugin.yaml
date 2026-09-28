@@ -1,0 +1,18 @@
+name: zoom_meeting_chat-platform
+label: Zoom Meeting Chat
+kind: platform
+version: 0.1.0
+description: DM-only Recall.ai-backed Zoom meeting chat platform for Hermes.
+author: Nous Research / Hermes Agent
+license: MIT
+requires_env:
+  - name: RECALL_API_KEY
+    description: Recall.ai API key
+    password: true
+  - name: RECALL_WEBHOOK_SECRET
+    description: Recall.ai workspace webhook signing secret (whsec_...)
+    password: true
+provides_tools:
+  - zoom_chat_join
+  - zoom_chat_leave
+  - zoom_chat_status

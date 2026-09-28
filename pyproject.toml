@@ -1,0 +1,20 @@
+[project]
+name = "hermes-zoom-meeting-chat"
+version = "0.1.0"
+description = "DM-only Recall.ai Zoom Meeting Chat platform plugin for Hermes"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Nous Research / Hermes Agent"}]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = [".", "/Users/benigeri/.hermes/hermes-agent"]
+
+[tool.ruff]
+line-length = 120
