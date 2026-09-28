@@ -72,7 +72,8 @@ def zoom_chat_join(args: dict[str, Any], **_: Any) -> str:
 
 
 def zoom_chat_leave(args: dict[str, Any] | None = None, **_: Any) -> str:
-    return _json(_run_on_runtime(lambda rt: rt.leave(), timeout=30.0))
+    confirmed_absent = (args or {}).get("confirmed_absent") is True
+    return _json(_run_on_runtime(lambda rt: rt.leave(confirmed_absent=confirmed_absent), timeout=30.0))
 
 
 def zoom_chat_status(args: dict[str, Any] | None = None, **_: Any) -> str:
@@ -102,8 +103,17 @@ def register_tools(ctx) -> None:
         description="Leave the active Zoom meeting chat bot, if known.",
         schema={
             "name": "zoom_chat_leave",
-            "description": "Leave the active Zoom meeting chat bot. Does not guess after uncertain create/crash state.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            "description": "Leave the active Zoom meeting chat bot. Set confirmed_absent only after manually verifying in Recall that an unknown bot is absent.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "confirmed_absent": {
+                        "type": "boolean",
+                        "description": "Clear unresolved local state only after manually verifying in Recall that the bot is absent."
+                    }
+                },
+                "additionalProperties": False
+            },
         },
         handler=zoom_chat_leave,
     )

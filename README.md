@@ -75,7 +75,7 @@ RECALL_WEBHOOK_SECRET=whsec_...
 5. Replies are sent only to the exact live DM route `meeting:{bot_id}:dm:{participant_id}`.
 6. Use `zoom_chat_leave` to leave. If create/leave is uncertain, check Recall before rejoining.
 
-An uncertain create or leave blocks another join in the running gateway. The plugin does not retry ambiguous mutations. Confirm the bot's state in Recall before restarting the gateway or otherwise resetting this in-memory safety state.
+An uncertain create or leave is stored under the active Hermes profile and blocks another join across gateway reconnects and restarts. If the saved state has a bot ID, `zoom_chat_leave` retries the idempotent leave request. If the bot ID is unknown, verify in the Recall dashboard that no bot exists, then call `zoom_chat_leave` with `confirmed_absent: true`. The plugin never clears ambiguous state merely because the gateway stopped.
 
 ## Safety boundaries
 

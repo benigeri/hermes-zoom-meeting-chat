@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import os
 import secrets
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
-from hermes_constants import hermes_home_key
+from hermes_constants import get_hermes_home, hermes_home_key
 
 from .client import RecallClient
 from .compat import zero_tool_schema_preflight
@@ -156,6 +159,7 @@ class ZoomChatRuntime:
         adapter: Any,
         loop: asyncio.AbstractEventLoop | None = None,
         dispatch: Callable[[Any], Any] | None = None,
+        state_path: Path | None = None,
     ) -> None:
         self.config = config
         self.client = client
@@ -171,6 +175,80 @@ class ZoomChatRuntime:
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=config.queue_size)
         self.accepting_callbacks = True
         self.shutting_down = False
+        self.state_path = state_path or (get_hermes_home() / "state" / "zoom_meeting_chat.json")
+        self._load_tombstone()
+
+    def _load_tombstone(self) -> None:
+        """Restore an unresolved bot as uncertain so restarts cannot double-join."""
+        if not self.state_path.exists():
+            return
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or raw.get("version") != 1:
+                raise ValueError("unsupported state")
+            fingerprint = str(raw.get("meeting_fingerprint") or "").strip()
+            if not fingerprint:
+                raise ValueError("missing meeting fingerprint")
+            generation = max(1, int(raw.get("generation") or 1))
+            self.generation = generation
+            self.active = ActiveMeeting(
+                meeting_url=str(raw.get("meeting_display") or "https://zoom.us/j/redacted"),
+                meeting_fingerprint=fingerprint,
+                generation=generation,
+                pairing_phrase="<unavailable-after-restart>",
+                pairing_expires_at=0,
+                phrase_revealed=True,
+                bot_id=str(raw.get("bot_id") or "").strip() or None,
+                uncertain=True,
+            )
+            self.accepting_callbacks = False
+        except Exception:
+            # A corrupt/unreadable state file is itself unresolved state. Keep a
+            # fail-closed in-memory marker instead of risking a second bot.
+            self.generation = max(1, self.generation)
+            self.active = ActiveMeeting(
+                meeting_url="https://zoom.us/j/redacted",
+                meeting_fingerprint="unreadable-tombstone",
+                generation=self.generation,
+                pairing_phrase="<unavailable-after-restart>",
+                pairing_expires_at=0,
+                phrase_revealed=True,
+                uncertain=True,
+            )
+            self.accepting_callbacks = False
+
+    def _persist_tombstone(self) -> None:
+        m = self.active
+        if not m:
+            raise RuntimeError("cannot persist empty meeting state")
+        payload = {
+            "version": 1,
+            "meeting_fingerprint": m.meeting_fingerprint,
+            "meeting_display": redact_meeting_url(m.meeting_url),
+            "generation": m.generation,
+            "bot_id": m.bot_id,
+            "created_at": m.created_at,
+        }
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.state_path.with_name(f".{self.state_path.name}.{os.getpid()}.tmp")
+        try:
+            with temp.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(temp, 0o600)
+            os.replace(temp, self.state_path)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _clear_tombstone(self) -> None:
+        try:
+            self.state_path.unlink()
+        except FileNotFoundError:
+            pass
 
     def _status_dict(self, *, include_phrase: bool = False) -> dict[str, Any]:
         m = self.active
@@ -220,6 +298,17 @@ class ZoomChatRuntime:
                 pairing_phrase=phrase,
                 pairing_expires_at=time.time() + self.config.pairing_ttl_seconds,
             )
+            try:
+                # Persist before the remote mutation. A crash or timeout can
+                # otherwise create a bot that a restarted gateway forgets.
+                self._persist_tombstone()
+            except Exception as exc:
+                self.active = None
+                return {
+                    "ok": False,
+                    "error": f"could not persist Zoom bot safety state; Create Bot was not called: {type(exc).__name__}",
+                    "create_bot_called": False,
+                }
             payload = build_create_bot_payload(self.config, clean_url)
             try:
                 resp = await self.client.create_bot(payload)
@@ -229,6 +318,15 @@ class ZoomChatRuntime:
                     return {"ok": False, "error": "Recall Create Bot response did not include a bot id; meeting state is uncertain", "uncertain": True}
                 self.active.bot_id = bot_id
                 self.active.bot_participant_id = str(resp.get("participant_id") or resp.get("bot_participant_id") or "").strip() or None
+                try:
+                    self._persist_tombstone()
+                except Exception:
+                    self.active.uncertain = True
+                    return {
+                        "ok": False,
+                        "error": "Recall bot was created but durable state could not be updated; meeting state is uncertain",
+                        "uncertain": True,
+                    }
                 out = self._status_dict(include_phrase=True)
                 self.active.phrase_revealed = True
                 out["ok"] = True
@@ -239,22 +337,44 @@ class ZoomChatRuntime:
                     self.active.uncertain = True
                 return {"ok": False, "error": f"Recall Create Bot did not complete; meeting state is uncertain: {type(exc).__name__}", "uncertain": True}
 
-    async def leave(self) -> dict[str, Any]:
+    async def leave(self, *, confirmed_absent: bool = False) -> dict[str, Any]:
         async with self.join_lock:
             m = self.active
             if not m:
                 return {"ok": True, "active": False, "left": False}
             self.accepting_callbacks = False
             self.chat_routes.clear()
-            if m.bot_id and not m.uncertain:
+            if confirmed_absent and not m.bot_id:
+                try:
+                    self._clear_tombstone()
+                except Exception as exc:
+                    return {"ok": False, "left": False, "uncertain": True, "error": f"confirmed-absent state cleanup failed: {type(exc).__name__}"}
+                self.active = None
+                return {"ok": True, "left": False, "cleared_confirmed_absent": True}
+            if m.bot_id:
                 try:
                     await self.client.leave_bot(m.bot_id)
+                    try:
+                        self._clear_tombstone()
+                    except Exception as exc:
+                        m.uncertain = True
+                        return {
+                            "ok": False,
+                            "left": True,
+                            "uncertain": True,
+                            "error": f"bot left but durable state cleanup failed: {type(exc).__name__}",
+                        }
                     self.active = None
                     return {"ok": True, "left": True, "bot_id": m.bot_id}
                 except Exception as exc:
                     m.uncertain = True
                     return {"ok": False, "left": False, "uncertain": True, "error": f"leave failed: {type(exc).__name__}"}
-            return {"ok": False, "left": False, "uncertain": True, "error": "active bot id is unknown or uncertain; check Recall dashboard"}
+            return {
+                "ok": False,
+                "left": False,
+                "uncertain": True,
+                "error": "active bot id is unknown; verify the bot is absent in Recall, then call zoom_chat_leave with confirmed_absent=true",
+            }
 
     async def shutdown(self) -> dict[str, Any]:
         self.shutting_down = True

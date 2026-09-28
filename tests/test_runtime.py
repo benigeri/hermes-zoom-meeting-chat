@@ -65,7 +65,7 @@ class FakeAdapter:
 
 
 @pytest.fixture()
-def runtime(monkeypatch):
+def runtime(monkeypatch, tmp_path):
     load_plugin_pkg("zoom_runtime_pkg")
     rt_mod = __import__("zoom_runtime_pkg.runtime", fromlist=["ZoomChatRuntime"])
     client_mod = __import__("zoom_runtime_pkg.client", fromlist=["RecallClient"])
@@ -87,7 +87,14 @@ def runtime(monkeypatch):
     adapter = FakeAdapter()
     client = client_mod.RecallClient("key", "https://us-west-2.recall.ai", transport=transport)
     loop = asyncio.new_event_loop()
-    rt = rt_mod.ZoomChatRuntime(config=cfg, client=client, adapter=adapter, loop=loop, dispatch=adapter.handle_message)
+    rt = rt_mod.ZoomChatRuntime(
+        config=cfg,
+        client=client,
+        adapter=adapter,
+        loop=loop,
+        dispatch=adapter.handle_message,
+        state_path=tmp_path / "zoom-state.json",
+    )
     return rt, transport, adapter
 
 
@@ -185,3 +192,57 @@ async def test_pairing_phrase_is_revealed_only_once(runtime):
     duplicate = await rt.join("https://example.zoom.us/j/123")
     assert duplicate["duplicate"] is True
     assert "pairing_phrase" not in duplicate
+
+
+@pytest.mark.asyncio
+async def test_failed_shutdown_survives_new_runtime_and_blocks_second_bot(runtime):
+    rt, transport, adapter = runtime
+    rt_mod = __import__(rt.__class__.__module__, fromlist=["ZoomChatRuntime"])
+    joined = await rt.join("https://example.zoom.us/j/123")
+    assert joined["ok"] is True
+    transport.raise_on_leave = TimeoutError("network")
+    shutdown = await rt.shutdown()
+    assert shutdown["ok"] is False
+
+    second_transport = FakeTransport()
+    client_mod = __import__("zoom_runtime_pkg.client", fromlist=["RecallClient"])
+    second_client = client_mod.RecallClient("key", "https://us-west-2.recall.ai", transport=second_transport)
+    fresh = rt_mod.ZoomChatRuntime(
+        config=rt.config,
+        client=second_client,
+        adapter=adapter,
+        loop=rt.loop,
+        dispatch=adapter.handle_message,
+        state_path=rt.state_path,
+    )
+    assert fresh.active is not None and fresh.active.uncertain is True
+    blocked = await fresh.join("https://example.zoom.us/j/456")
+    assert blocked["ok"] is False
+    assert not second_transport.requests
+
+    recovered = await fresh.leave()
+    assert recovered["ok"] is True and recovered["left"] is True
+    assert not rt.state_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_unknown_persisted_bot_requires_explicit_confirmed_absent(runtime):
+    rt, transport, _adapter = runtime
+    transport.raise_on_create = TimeoutError("network")
+    uncertain = await rt.join("https://example.zoom.us/j/123")
+    assert uncertain["uncertain"] is True and rt.state_path.exists()
+    ordinary = await rt.leave()
+    assert ordinary["ok"] is False and rt.state_path.exists()
+    cleared = await rt.leave(confirmed_absent=True)
+    assert cleared["ok"] is True and cleared["cleared_confirmed_absent"] is True
+    assert rt.active is None and not rt.state_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_absent_does_not_skip_leave_for_known_bot(runtime):
+    rt, transport, _adapter = runtime
+    joined = await rt.join("https://example.zoom.us/j/123")
+    assert joined["ok"] is True
+    result = await rt.leave(confirmed_absent=True)
+    assert result["ok"] is True and result["left"] is True
+    assert any(request[1].endswith("/leave_call/") for request in transport.requests)
