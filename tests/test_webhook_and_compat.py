@@ -16,7 +16,7 @@ from conftest import load_plugin_pkg
 def signed(secret: str, wid: str, ts: int, body: bytes):
     wh = __import__("zoom_webhook_pkg.webhook", fromlist=["_secret_bytes"])
     digest = hmac.new(wh._secret_bytes(secret), f"{wid}.{ts}.".encode() + body, hashlib.sha256).digest()
-    return {"webhook-id": wid, "webhook-timestamp": str(ts), "webhook-signature": "v1=" + base64.b64encode(digest).decode()}
+    return {"webhook-id": wid, "webhook-timestamp": str(ts), "webhook-signature": "v1," + base64.b64encode(digest).decode()}
 
 
 @pytest.mark.asyncio
@@ -30,7 +30,7 @@ async def test_hmac_admission_dedup_and_queue_full():
     )
     receiver = wh.RecallWebhookReceiver(runtime)
     now = int(time.time())
-    body = json.dumps({"type": "participant_events.chat_message", "bot_id": "bot-1", "participant_id": "paul", "message": {"text": "hi", "chat_type": "dm"}}).encode()
+    body = json.dumps({"event": "participant_events.chat_message", "data": {"data": {"participant": {"id": 7, "name": "Paul"}, "timestamp": {"absolute": "2026-09-28T00:00:00Z", "relative": 1.0}, "data": {"text": "hi", "to": "only_bot"}}, "bot": {"id": "bot-1"}}}).encode()
     headers = signed(runtime.config.webhook_secret, "evt-1", now, body)
     first = await receiver.admit(method="POST", content_type="application/json", headers=headers, raw_body=body)
     dup = await receiver.admit(method="POST", content_type="application/json", headers=headers, raw_body=body)

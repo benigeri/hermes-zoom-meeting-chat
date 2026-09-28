@@ -11,8 +11,8 @@ BOT_NAME = "Hio"
 ALLOWED_RECALL_BASE_URLS = {
     "https://us-west-2.recall.ai",
     "https://us-east-1.recall.ai",
-    "https://eu-west-1.recall.ai",
-    "https://api.recall.ai",
+    "https://eu-central-1.recall.ai",
+    "https://ap-northeast-1.recall.ai",
 }
 
 

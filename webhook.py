@@ -21,24 +21,28 @@ class WebhookAdmission:
 
 
 def _secret_bytes(secret: str) -> bytes:
-    raw = secret[len("whsec_"):] if secret.startswith("whsec_") else secret
+    if not secret.startswith("whsec_"):
+        raise ValueError("Recall webhook secret must begin with whsec_")
+    raw = secret[len("whsec_"):]
     try:
-        return base64.b64decode(raw + "=" * (-len(raw) % 4), validate=False)
-    except Exception:
-        return raw.encode("utf-8")
+        return base64.b64decode(raw + "=" * (-len(raw) % 4), validate=True)
+    except Exception as exc:
+        raise ValueError("Recall webhook secret has invalid base64") from exc
 
 
 def _candidate_sigs(header: str) -> list[str]:
     vals: list[str] = []
-    for part in str(header or "").replace(" ", "").split(","):
+    # Recall documents space-separated signatures in ``v1,<base64>`` form.
+    # Accept the common ``v1=<base64>`` spelling as a compatibility courtesy,
+    # but never accept an unversioned value.
+    for part in str(header or "").split():
+        part = part.strip()
         if not part:
             continue
-        if part.startswith("v1="):
+        if part.startswith("v1,"):
             vals.append(part[3:])
-        elif part.startswith("v1,"):
+        elif part.startswith("v1="):
             vals.append(part[3:])
-        elif part.startswith("v1") and len(part) > 2:
-            vals.append(part[2:].lstrip("="))
     return vals
 
 

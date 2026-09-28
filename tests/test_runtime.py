@@ -28,9 +28,9 @@ class FakeTransport:
             if self.raise_on_create:
                 raise self.raise_on_create
             return dict(self.create_response)
-        if url.endswith("/chat_message/"):
+        if url.endswith("/send_chat_message/"):
             return {"id": "msg-out", "sent": True}
-        if url.endswith("/leave/"):
+        if url.endswith("/leave_call/"):
             return {"left": True}
         return {}
 
@@ -96,13 +96,16 @@ async def test_join_payload_is_chat_only_and_redacted(runtime):
     assert result["pairing_phrase"]
     payload = transport.requests[0][2]
     assert payload["bot_name"] == "Hio"
-    assert payload["transcript"] is None
-    assert payload["meeting_metadata"] is None
-    assert payload["participant_events"] == {}
-    assert payload["retention"] is None
-    assert payload["video_mixed_mp4"] is None
-    assert payload["audio_mixed_mp3"] is None
-    assert payload["real_time_endpoints"][0]["events"] == ["participant_events.chat_message"]
+    assert payload["meeting_url"].endswith("?pwd=secret")
+    recording = payload["recording_config"]
+    assert recording["transcript"] is None
+    assert recording["meeting_metadata"] is None
+    assert recording["participant_events"] == {}
+    assert recording["retention"] is None
+    assert recording["video_mixed_mp4"] is None
+    assert recording["audio_mixed_mp3"] is None
+    assert recording["realtime_endpoints"][0]["events"] == ["participant_events.chat_message"]
+    assert payload["automatic_leave"]["everyone_left_timeout"] == {"timeout": 60}
     assert payload["automatic_leave"]["in_call_not_recording_timeout"] == 1800
     assert "pwd=" not in result["meeting_url"]
 
@@ -112,28 +115,31 @@ async def test_pairing_consumes_phrase_and_operator_dm_dispatch(runtime):
     rt, _transport, adapter = runtime
     joined = await rt.join("https://example.zoom.us/j/123?pwd=secret")
     phrase = joined["pairing_phrase"]
-    assert await rt.process_callback_event({"type": "participant_events.chat_message", "bot_id": "bot-1", "participant_id": "intruder", "message": {"text": "hello", "chat_type": "dm"}}) is None
-    assert await rt.process_callback_event({"type": "participant_events.chat_message", "bot_id": "bot-1", "participant_id": "paul", "participant_name": "Paul", "message": {"text": phrase, "chat_type": "dm"}}) is None
+    def incoming(sender, text, *, to="only_bot", wid="evt"):
+        return {"webhook_id": wid, "event": "participant_events.chat_message", "data": {"data": {"participant": {"id": sender, "name": "Paul"}, "timestamp": {"absolute": "2026-09-28T00:00:00Z", "relative": 1.0}, "data": {"text": text, "to": to}}, "bot": {"id": "bot-1"}}}
+    assert await rt.process_callback_event(incoming("intruder", "hello", wid="evt-0")) is None
+    assert await rt.process_callback_event(incoming("paul", phrase, wid="evt-1")) is None
     assert rt.active.operator_participant_id == "paul"
-    event = await rt.process_callback_event({"type": "participant_events.chat_message", "bot_id": "bot-1", "participant_id": "paul", "participant_name": "Paul", "message": {"id": "m2", "text": "reply privately", "chat_type": "dm"}})
+    event = await rt.process_callback_event(incoming("paul", "reply privately", wid="m2"))
     assert event is not None
     assert event.source.chat_type == "dm"
     assert event.source.role_authorized is True
     assert event.internal is False
     assert event.allow_gateway_control is False
     assert adapter.sources[-1]["chat_id"] == "meeting:bot-1:dm:paul"
-    assert await rt.process_callback_event({"type": "participant_events.chat_message", "bot_id": "bot-1", "participant_id": "other", "message": {"text": "ignored", "chat_type": "dm"}}) is None
-    assert await rt.process_callback_event({"type": "participant_events.chat_message", "bot_id": "bot-1", "participant_id": "paul", "message": {"text": "public", "chat_type": "public"}}) is None
+    assert await rt.process_callback_event(incoming("other", "ignored", wid="m3")) is None
+    assert await rt.process_callback_event(incoming("paul", "public", to="everyone", wid="m4")) is None
 
 
 @pytest.mark.asyncio
 async def test_exact_dm_send_route_and_stale_rejection(runtime):
     rt, transport, _adapter = runtime
     joined = await rt.join("https://example.zoom.us/j/123")
-    await rt.process_callback_event({"type": "participant_events.chat_message", "bot_id": "bot-1", "participant_id": "paul", "message": {"text": joined["pairing_phrase"], "chat_type": "dm"}})
+    incoming = {"webhook_id": "evt-1", "event": "participant_events.chat_message", "data": {"data": {"participant": {"id": "paul", "name": "Paul"}, "timestamp": {"absolute": "2026-09-28T00:00:00Z", "relative": 1.0}, "data": {"text": joined["pairing_phrase"], "to": "only_bot"}}, "bot": {"id": "bot-1"}}}
+    await rt.process_callback_event(incoming)
     resp = await rt.send_reply("meeting:bot-1:dm:paul", "hello")
     assert resp["id"] == "msg-out"
-    assert transport.requests[-1][1].endswith("/api/v1/bot/bot-1/chat_message/")
+    assert transport.requests[-1][1].endswith("/api/v1/bot/bot-1/send_chat_message/")
     assert transport.requests[-1][2] == {"to": "paul", "message": "hello"}
     with pytest.raises(ValueError):
         await rt.send_reply("meeting:bot-1:dm:other", "nope")

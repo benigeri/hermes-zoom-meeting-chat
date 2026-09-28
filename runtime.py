@@ -62,36 +62,44 @@ def normalize_meeting_url(raw: str) -> tuple[str, str]:
     host = p.netloc.lower()
     if not (host == "zoom.us" or host.endswith(".zoom.us")):
         raise ValueError("meeting_url must be hosted under zoom.us")
-    clean = urlunsplit(("https", host, p.path.rstrip("/"), "", ""))
-    fp = hashlib.sha256(clean.encode("utf-8")).hexdigest()
-    return clean, fp
+    # Preserve the query: Zoom commonly carries the meeting passcode in
+    # ``?pwd=...``.  Redaction is a presentation concern, never a mutation of
+    # the provider request.
+    normalized = urlunsplit(("https", host, p.path.rstrip("/"), p.query, ""))
+    fp = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return normalized, fp
 
 
 def build_create_bot_payload(config: ZoomChatConfig, meeting_url: str) -> dict[str, Any]:
     return {
         "meeting_url": meeting_url,
         "bot_name": BOT_NAME,
-        "recording_mode": "speaker_view",
-        "transcript": None,
-        "audio_mixed_raw": None,
-        "audio_mixed_mp3": None,
-        "video_mixed_mp4": None,
-        "video_separate_mp4": None,
-        "audio_separate_raw": None,
-        "meeting_metadata": None,
-        "participant_events": {},
-        "retention": None,
-        "real_time_endpoints": [
-            {
-                "type": "webhook",
-                "url": f"{config.callback_public_base_url}/webhooks/recall/zoom-meeting-chat",
-                "events": ["participant_events.chat_message"],
-            }
-        ],
+        "recording_config": {
+            "transcript": None,
+            "video_mixed_mp4": None,
+            "audio_mixed_raw": None,
+            "audio_mixed_mp3": None,
+            "video_separate_mp4": None,
+            "audio_separate_raw": None,
+            "audio_separate_mp3": None,
+            "video_mixed_flv": None,
+            "video_separate_png": None,
+            "video_separate_h264": None,
+            "meeting_metadata": None,
+            "participant_events": {},
+            "retention": None,
+            "realtime_endpoints": [
+                {
+                    "type": "webhook",
+                    "url": f"{config.callback_public_base_url}/webhooks/recall/zoom-meeting-chat",
+                    "events": ["participant_events.chat_message"],
+                }
+            ],
+        },
         "automatic_leave": {
             "waiting_room_timeout": config.automatic_leave_timeout,
             "noone_joined_timeout": config.automatic_leave_timeout,
-            "everyone_left_timeout": 60,
+            "everyone_left_timeout": {"timeout": 60},
             "in_call_not_recording_timeout": config.in_call_not_recording_timeout,
         },
     }
@@ -273,21 +281,27 @@ class ZoomChatRuntime:
         )
 
     async def process_callback_event(self, event: dict[str, Any]) -> Any | None:
-        participant = event.get("participant") if isinstance(event.get("participant"), dict) else {}
-        message = event.get("message") if isinstance(event.get("message"), dict) else event
-        text = str(message.get("text") or message.get("message") or "")
-        participant_id = str(participant.get("id") or event.get("participant_id") or "")
-        participant_name = str(participant.get("name") or event.get("participant_name") or "")
-        message_id = str(event.get("webhook_id") or event.get("id") or message.get("id") or secrets.token_hex(8))
-        chat_type = str(event.get("chat_type") or message.get("chat_type") or "dm").lower()
-        to_bot = bool(event.get("to_bot", True))
-        bot_id = str(event.get("bot_id") or event.get("bot", {}).get("id") if isinstance(event.get("bot"), dict) else event.get("bot_id") or "")
+        # Recall's real-time envelope is data -> data ->
+        # {participant, timestamp, data: {text, to}}.  ``to`` is exactly
+        # ``only_bot`` for a DM and ``everyone`` for public chat.  Do not infer
+        # DM from a missing field.
+        envelope = event.get("data") if isinstance(event.get("data"), dict) else {}
+        chat_event = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
+        participant = chat_event.get("participant") if isinstance(chat_event.get("participant"), dict) else {}
+        message = chat_event.get("data") if isinstance(chat_event.get("data"), dict) else {}
+        text = str(message.get("text") or "")
+        recipient = str(message.get("to") or "").lower()
+        participant_id = str(participant.get("id") or "")
+        participant_name = str(participant.get("name") or "")
+        message_id = str(event.get("webhook_id") or "")
+        bot = envelope.get("bot") if isinstance(envelope.get("bot"), dict) else {}
+        bot_id = str(bot.get("id") or "")
         m = self.active
         if not self.accepting_callbacks or not m or not m.bot_id:
             return None
-        if bot_id and bot_id != m.bot_id:
+        if not bot_id or bot_id != m.bot_id:
             return None
-        if chat_type != "dm" or not to_bot or len(text) > 4000 or not participant_id:
+        if recipient != "only_bot" or not text or len(text) > 4000 or not participant_id or not message_id:
             return None
         return self.build_operator_event(text=text, participant_id=participant_id, participant_name=participant_name, message_id=message_id)
 
