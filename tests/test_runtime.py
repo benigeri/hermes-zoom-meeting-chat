@@ -597,3 +597,85 @@ async def test_confirmed_absent_keeps_known_bot_when_provider_is_not_done(runtim
     assert result["uncertain"] is True
     assert rt.active is not None
     assert rt.state_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_matching_terminal_status_webhook_clears_active_state(runtime):
+    rt, transport, _adapter = runtime
+    rt_mod = __import__(rt.__class__.__module__, fromlist=["RecallBotStatusEvent"])
+    joined = await rt.join("https://example.zoom.us/j/123")
+    assert joined["ok"] is True and rt.state_path.exists()
+
+    result = await rt.handle_bot_status_event(
+        rt_mod.RecallBotStatusEvent(
+            bot_id="bot-1",
+            code="call_ended",
+            message_id="status-1",
+        )
+    )
+
+    assert result == {"ok": True, "handled": True, "terminal": True}
+    assert rt.active is None
+    assert rt.accepting_callbacks is False
+    assert not rt.state_path.exists()
+    assert not any(url.endswith("/leave_call/") for _method, url, _body in transport.requests)
+
+
+@pytest.mark.asyncio
+async def test_terminal_status_webhook_fails_closed_when_tombstone_clear_fails(runtime, monkeypatch):
+    rt, _transport, _adapter = runtime
+    rt_mod = __import__(rt.__class__.__module__, fromlist=["RecallBotStatusEvent"])
+    await rt.join("https://example.zoom.us/j/123")
+
+    def fail_clear():
+        raise OSError("disk")
+
+    monkeypatch.setattr(rt, "_clear_tombstone", fail_clear)
+    result = await rt.handle_bot_status_event(
+        rt_mod.RecallBotStatusEvent(
+            bot_id="bot-1",
+            code="done",
+            message_id="status-2",
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["uncertain"] is True
+    assert rt.active is not None and rt.active.uncertain is True
+    assert rt.state_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_status_webhook_ignores_wrong_nonterminal_and_unknown_bot_state(runtime):
+    rt, _transport, _adapter = runtime
+    rt_mod = __import__(rt.__class__.__module__, fromlist=["RecallBotStatusEvent"])
+    await rt.join("https://example.zoom.us/j/123")
+
+    wrong = await rt.handle_bot_status_event(
+        rt_mod.RecallBotStatusEvent(
+            bot_id="bot-2",
+            code="call_ended",
+            message_id="status-3",
+        )
+    )
+    nonterminal = await rt.handle_bot_status_event(
+        rt_mod.RecallBotStatusEvent(
+            bot_id="bot-1",
+            code="in_call_recording",
+            message_id="status-4",
+        )
+    )
+    assert wrong == {"ok": True, "handled": False, "terminal": True}
+    assert nonterminal == {"ok": True, "handled": False, "terminal": False}
+    assert rt.active is not None
+
+    rt.active.bot_id = None
+    unknown = await rt.handle_bot_status_event(
+        rt_mod.RecallBotStatusEvent(
+            bot_id="bot-1",
+            code="done",
+            message_id="status-5",
+        )
+    )
+    assert unknown == {"ok": True, "handled": False, "terminal": True}
+    assert rt.active is not None

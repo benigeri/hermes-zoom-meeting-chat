@@ -78,6 +78,18 @@ class RecallTranscriptEvent:
     message_id: str
 
 
+@dataclass(frozen=True)
+class RecallBotStatusEvent:
+    bot_id: str
+    code: str
+    message_id: str
+
+
+TERMINAL_BOT_STATUS_CODES = frozenset(
+    {"call_ended", "done", "fatal", "media_expired"}
+)
+
+
 _PUBLIC_MENTION_RE = re.compile(
     r"^\s*(?:@hio\s*:?[ \t]+|hio\s*:[ \t]+)(?P<request>\S(?:.*\S)?)\s*$",
     re.IGNORECASE,
@@ -202,6 +214,28 @@ def parse_recall_transcript_event(event: dict[str, Any]) -> RecallTranscriptEven
         participant_name=participant_name,
         text=text,
         start_relative=max(0.0, start_relative or 0.0),
+        message_id=message_id,
+    )
+
+
+def parse_recall_bot_status_event(event: dict[str, Any]) -> RecallBotStatusEvent:
+    """Parse Recall's documented signed bot-status envelope."""
+    event_type = str(event.get("event") or event.get("type") or "").strip()
+    envelope_value = event.get("data")
+    if not event_type.startswith("bot.") or not isinstance(envelope_value, dict):
+        raise ValueError("missing bot status envelope")
+    status_value = envelope_value.get("data")
+    bot_value = envelope_value.get("bot")
+    if not isinstance(status_value, dict) or not isinstance(bot_value, dict):
+        raise ValueError("malformed bot status event")
+    code = str(status_value.get("code") or "").strip()
+    bot_id = str(bot_value.get("id") or "").strip()
+    message_id = str(event.get("webhook_id") or "").strip()
+    if not code or not bot_id or not message_id or event_type != f"bot.{code}":
+        raise ValueError("incomplete or inconsistent bot status event")
+    return RecallBotStatusEvent(
+        bot_id=bot_id,
+        code=code,
         message_id=message_id,
     )
 
@@ -425,6 +459,43 @@ class ZoomChatRuntime:
 
     async def status(self) -> dict[str, Any]:
         return self._status_dict()
+
+    async def handle_bot_status_event(
+        self, event: RecallBotStatusEvent
+    ) -> dict[str, Any]:
+        """Apply authoritative signed provider lifecycle evidence.
+
+        Status webhooks are independent of the per-bot real-time callback
+        stream, so process them even after ordinary callbacks have stopped.
+        The join lock serializes lifecycle cleanup with join and leave.
+        """
+        terminal = event.code in TERMINAL_BOT_STATUS_CODES
+        async with self.join_lock:
+            m = self.active
+            if (
+                not terminal
+                or not m
+                or not m.bot_id
+                or m.bot_id != event.bot_id
+            ):
+                return {"ok": True, "handled": False, "terminal": terminal}
+
+            self.accepting_callbacks = False
+            self.chat_routes.clear()
+            m.transcript_segments.clear()
+            try:
+                self._clear_tombstone()
+            except Exception as exc:
+                m.uncertain = True
+                return {
+                    "ok": False,
+                    "handled": False,
+                    "terminal": True,
+                    "uncertain": True,
+                    "error": f"terminal bot status cleanup failed: {type(exc).__name__}",
+                }
+            self.active = None
+            return {"ok": True, "handled": True, "terminal": True}
 
     async def join(self, meeting_url: str) -> dict[str, Any]:
         compat = zero_tool_schema_preflight()

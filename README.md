@@ -1,6 +1,6 @@
 # Hermes Zoom Meeting Chat
 
-Standalone Hermes platform plugin for a narrow v0.5.2 Zoom meeting-chat, voice-command, and calendar auto-join flow backed by Recall.ai.
+Standalone Hermes platform plugin for a narrow v0.5.3 Zoom meeting-chat, voice-command, and calendar auto-join flow backed by Recall.ai.
 
 - One active meeting per Hermes profile
 - One visible Zoom participant named `Hio`
@@ -13,6 +13,7 @@ Standalone Hermes platform plugin for a narrow v0.5.2 Zoom meeting-chat, voice-c
 - Other participants cannot invoke Hio; ordinary group-chat messages are ignored
 - No retained recording, audio, video, transcript, or media artifacts; no automatic summaries
 - Optional native-Hermes cron companion auto-joins accepted Zoom events from Paul's primary Google Calendar
+- Signed Recall bot-status webhooks clear ended meeting state so back-to-back auto-joins do not remain blocked by a stale local tombstone
 
 The plugin stays inert unless explicitly enabled and configured with Recall credentials plus a public HTTPS callback URL. The public lane relies on Hermes's generic per-source context policy to disable private memory and context files; the voice extension adds no further Hermes-core code.
 
@@ -75,7 +76,10 @@ RECALL_API_KEY=...
 RECALL_WEBHOOK_SECRET=whsec_...
 ```
 
-`RECALL_WEBHOOK_SECRET` must be the Recall workspace signing secret and must begin with `whsec_`. Unsigned callbacks and URL-token fallback are intentionally unsupported.
+`RECALL_WEBHOOK_SECRET` must match the Recall/Svix endpoint signing secret and must begin with `whsec_`. Unsigned callbacks and URL-token fallback are intentionally unsupported.
+
+In Recall's regional Webhooks dashboard, create one endpoint at
+`https://<callback_public_base_url>/webhooks/recall/zoom-meeting-chat` and subscribe it to `bot.call_ended`, `bot.done`, and `bot.fatal`. The endpoint secret must match `RECALL_WEBHOOK_SECRET`. These signed lifecycle events are separate from the per-bot real-time chat and transcript endpoint configured in the Create Bot payload.
 
 `callback_bind_host` must remain loopback (`127.0.0.1`, `localhost`, or `::1`). Put HTTPS and public exposure in a reverse proxy or tunnel whose proxy-to-plugin hop is local or authenticated and encrypted. Suppress webhook bodies and secrets in proxy access/error logs.
 
@@ -90,7 +94,7 @@ RECALL_WEBHOOK_SECRET=whsec_...
 7. To invoke Hio by voice, begin a finalized utterance with `Hotel India` or `Hotel Hotel`, such as `Hotel India, what did we decide?`. Compatible `Hey Hio` forms remain aliases. Only the paired participant ID can trigger this route. Hio first posts `Heard — working on it.`, then posts one complete answer to `everyone` in Zoom chat.
 8. Recall streams finalized utterances from all participants. The plugin keeps them in memory during the meeting and supplies the transcript so far to every public typed or spoken invocation.
 9. The public route uses its own Hermes group-chat session and technically suppresses profile memory and context files. Its only permitted ambient model capability is Hermes's `x_search` through the Tool Search bridge; private and platform-management tools remain unavailable. Hio must answer from the operator request, meeting transcript, and any explicit public web lookup.
-10. Use `zoom_chat_leave` to leave. The plugin stops callback admission, removes live routes, and clears its in-memory transcript before it calls Recall's leave endpoint, including when the provider leave later fails.
+10. Use `zoom_chat_leave` to leave. The plugin stops callback admission, removes live routes, and clears its in-memory transcript before it calls Recall's leave endpoint, including when the provider leave later fails. A matching signed terminal bot-status webhook also clears the local active state and tombstone after Recall ends the bot automatically.
 
 ### Calendar auto-join companion
 

@@ -10,12 +10,17 @@ from typing import Any, Mapping
 
 from gateway.platforms.helpers import MessageDeduplicator
 
-from .runtime import parse_recall_chat_event, parse_recall_transcript_event
+from .runtime import (
+    parse_recall_bot_status_event,
+    parse_recall_chat_event,
+    parse_recall_transcript_event,
+)
 
 MAX_BODY_BYTES = 64 * 1024
 CHAT_EVENT = "participant_events.chat_message"
 TRANSCRIPT_EVENT = "transcript.data"
 ACCEPTED_EVENTS = {CHAT_EVENT, TRANSCRIPT_EVENT}
+BOT_STATUS_PREFIX = "bot."
 
 
 @dataclass
@@ -92,6 +97,20 @@ class RecallWebhookReceiver:
         except Exception as exc:
             return WebhookAdmission(400, str(exc))
         event_type = str(payload.get("event") or payload.get("type") or "")
+        if event_type.startswith(BOT_STATUS_PREFIX):
+            payload["webhook_id"] = wid
+            try:
+                candidate = parse_recall_bot_status_event(payload)
+            except ValueError as exc:
+                return WebhookAdmission(400, str(exc))
+            async with self.runtime.admission_lock:
+                if self.dedup.contains(wid):
+                    return WebhookAdmission(204, "")
+                result = await self.runtime.handle_bot_status_event(candidate)
+                if not result.get("ok"):
+                    return WebhookAdmission(503, "lifecycle cleanup failed")
+                self.dedup.is_duplicate(wid)
+                return WebhookAdmission(204, "")
         if event_type not in ACCEPTED_EVENTS:
             return WebhookAdmission(204, "")
         payload["webhook_id"] = wid

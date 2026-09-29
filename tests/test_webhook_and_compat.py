@@ -169,6 +169,104 @@ async def test_signed_final_transcript_is_admitted_and_malformed_transcript_is_r
     assert runtime.queue.qsize() == 1
 
 
+@pytest.mark.asyncio
+async def test_signed_terminal_status_bypasses_full_queue_and_cleans_runtime():
+    load_plugin_pkg("zoom_webhook_status_pkg")
+    wh = __import__("zoom_webhook_status_pkg.webhook", fromlist=["RecallWebhookReceiver"])
+    handled = []
+
+    async def handle_status(candidate):
+        handled.append(candidate)
+        return {"ok": True, "handled": True, "terminal": True}
+
+    queue = asyncio.Queue(maxsize=1)
+    queue.put_nowait({"already": "full"})
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(webhook_secret="whsec_dGVzdA", webhook_replay_window_seconds=300),
+        queue=queue,
+        admission_lock=asyncio.Lock(),
+        active=SimpleNamespace(bot_id="bot-1"),
+        accepting_callbacks=False,
+        shutting_down=False,
+        handle_bot_status_event=handle_status,
+    )
+    receiver = wh.RecallWebhookReceiver(runtime)
+    now = int(time.time())
+    body = json.dumps({
+        "event": "bot.call_ended",
+        "data": {
+            "data": {"code": "call_ended", "sub_code": "call_ended_by_host"},
+            "bot": {"id": "bot-1", "metadata": {}},
+        },
+    }).encode()
+
+    first = await receiver.admit(
+        method="POST",
+        content_type="application/json",
+        headers=signed(runtime.config.webhook_secret, "status-1", now, body),
+        raw_body=body,
+    )
+    duplicate = await receiver.admit(
+        method="POST",
+        content_type="application/json",
+        headers=signed(runtime.config.webhook_secret, "status-1", now, body),
+        raw_body=body,
+    )
+
+    assert first.status == 204
+    assert duplicate.status == 204
+    assert len(handled) == 1
+    assert handled[0].bot_id == "bot-1"
+    assert handled[0].code == "call_ended"
+    assert runtime.queue.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_status_webhook_rejects_malformed_payload_and_retries_cleanup_failure():
+    load_plugin_pkg("zoom_webhook_status_failure_pkg")
+    wh = __import__("zoom_webhook_status_failure_pkg.webhook", fromlist=["RecallWebhookReceiver"])
+
+    async def fail_status(_candidate):
+        return {"ok": False, "uncertain": True}
+
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(webhook_secret="whsec_dGVzdA", webhook_replay_window_seconds=300),
+        queue=asyncio.Queue(maxsize=1),
+        admission_lock=asyncio.Lock(),
+        active=SimpleNamespace(bot_id="bot-1"),
+        accepting_callbacks=True,
+        shutting_down=False,
+        handle_bot_status_event=fail_status,
+    )
+    receiver = wh.RecallWebhookReceiver(runtime)
+    now = int(time.time())
+
+    malformed = json.dumps({
+        "event": "bot.done",
+        "data": {"data": {"code": "done"}, "bot": {"id": ""}},
+    }).encode()
+    malformed_result = await receiver.admit(
+        method="POST",
+        content_type="application/json",
+        headers=signed(runtime.config.webhook_secret, "status-bad", now, malformed),
+        raw_body=malformed,
+    )
+    assert malformed_result.status == 400
+
+    valid = json.dumps({
+        "event": "bot.done",
+        "data": {"data": {"code": "done"}, "bot": {"id": "bot-1"}},
+    }).encode()
+    failed = await receiver.admit(
+        method="POST",
+        content_type="application/json",
+        headers=signed(runtime.config.webhook_secret, "status-retry", now, valid),
+        raw_body=valid,
+    )
+    assert failed.status == 503
+    assert not receiver.dedup.contains("status-retry")
+
+
 def test_compatibility_preflight_success_and_failures(monkeypatch):
     load_plugin_pkg("zoom_compat_pkg")
     compat = __import__("zoom_compat_pkg.compat", fromlist=["zero_tool_schema_preflight"])
