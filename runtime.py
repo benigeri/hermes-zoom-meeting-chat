@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -17,6 +19,17 @@ from .client import RecallClient
 from .compat import zero_tool_schema_preflight
 from .config import BOT_NAME, PLATFORM, ZoomChatConfig
 from .redact import redact_meeting_url, redact_text
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TranscriptSegment:
+    participant_id: str
+    participant_name: str
+    text: str
+    start_relative: float
 
 
 @dataclass
@@ -33,6 +46,7 @@ class ActiveMeeting:
     operator_name: str | None = None
     uncertain: bool = False
     created_at: float = field(default_factory=time.time)
+    transcript_segments: list[TranscriptSegment] = field(default_factory=list)
 
     @property
     def paired(self) -> bool:
@@ -50,6 +64,47 @@ class RecallChatEvent:
     text: str
     recipient: str
     message_id: str
+
+
+@dataclass(frozen=True)
+class RecallTranscriptEvent:
+    bot_id: str
+    participant_id: str
+    participant_name: str
+    text: str
+    start_relative: float
+    message_id: str
+
+
+_PUBLIC_MENTION_RE = re.compile(
+    r"^\s*(?:@hio\s*:?[ \t]+|hio\s*:[ \t]+)(?P<request>\S(?:.*\S)?)\s*$",
+    re.IGNORECASE,
+)
+_VOICE_WAKE_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:hey|hello|hi)\s*,?\s+h[\s.-]*i[\s.-]*o"
+    r"|hotel\s+(?:india|hotel)"
+    r")\s*[:,]?\s+(?P<request>\S(?:.*\S)?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def extract_public_request(text: str) -> str | None:
+    """Return the request from an anchored Zoom mention, or ``None``.
+
+    Recall documents the chat text and audience, not a structured Zoom mention
+    entity. Keep parsing deliberately narrow: the invocation must start the
+    message, and ``Hio:`` remains a compatibility fallback if Zoom strips the
+    native ``@`` marker.
+    """
+    match = _PUBLIC_MENTION_RE.match(text or "")
+    return match.group("request") if match else None
+
+
+def extract_voice_request(text: str) -> str | None:
+    """Return the request from an anchored finalized voice invocation."""
+    match = _VOICE_WAKE_RE.match(text or "")
+    return match.group("request") if match else None
 
 
 def parse_recall_chat_event(event: dict[str, Any]) -> RecallChatEvent:
@@ -79,6 +134,53 @@ def parse_recall_chat_event(event: dict[str, Any]) -> RecallChatEvent:
         participant_name=participant_name,
         text=text,
         recipient=recipient,
+        message_id=message_id,
+    )
+
+
+def parse_recall_transcript_event(event: dict[str, Any]) -> RecallTranscriptEvent:
+    """Parse Recall's documented finalized transcript envelope, failing closed."""
+    envelope_value = event.get("data")
+    if not isinstance(envelope_value, dict):
+        raise ValueError("missing data envelope")
+    transcript_value = envelope_value.get("data")
+    bot_value = envelope_value.get("bot")
+    if not isinstance(transcript_value, dict) or not isinstance(bot_value, dict):
+        raise ValueError("malformed transcript event")
+    participant_value = transcript_value.get("participant")
+    words_value = transcript_value.get("words")
+    if not isinstance(participant_value, dict) or not isinstance(words_value, list) or not words_value:
+        raise ValueError("missing transcript participant or words")
+    bot_id = str(bot_value.get("id") or "").strip()
+    participant_id = str(participant_value.get("id") or "").strip()
+    participant_name = str(participant_value.get("name") or "").strip() or "Unknown participant"
+    message_id = str(event.get("webhook_id") or "").strip()
+    parts: list[str] = []
+    start_relative: float | None = None
+    for word in words_value:
+        if not isinstance(word, dict):
+            raise ValueError("malformed transcript word")
+        word_text = str(word.get("text") or "").strip()
+        if word_text:
+            parts.append(word_text)
+        if start_relative is None:
+            timestamp = word.get("start_timestamp")
+            if isinstance(timestamp, dict):
+                relative = timestamp.get("relative")
+                if isinstance(relative, (int, float, str)):
+                    try:
+                        start_relative = float(relative)
+                    except ValueError:
+                        pass
+    text = " ".join(parts).strip()
+    if not bot_id or not participant_id or not message_id or not text or len(text) > 4000:
+        raise ValueError("incomplete or oversized transcript event")
+    return RecallTranscriptEvent(
+        bot_id=bot_id,
+        participant_id=participant_id,
+        participant_name=participant_name,
+        text=text,
+        start_relative=max(0.0, start_relative or 0.0),
         message_id=message_id,
     )
 
@@ -120,7 +222,15 @@ def build_create_bot_payload(config: ZoomChatConfig, meeting_url: str) -> dict[s
         "meeting_url": meeting_url,
         "bot_name": BOT_NAME,
         "recording_config": {
-            "transcript": None,
+            "transcript": {
+                "provider": {
+                    "recallai_streaming": {
+                        "mode": "prioritize_low_latency",
+                        "language_code": "en",
+                    }
+                },
+                "diarization": {"use_separate_streams_when_available": True},
+            },
             "video_mixed_mp4": None,
             "audio_mixed_raw": None,
             "audio_mixed_mp3": None,
@@ -137,7 +247,7 @@ def build_create_bot_payload(config: ZoomChatConfig, meeting_url: str) -> dict[s
                 {
                     "type": "webhook",
                     "url": f"{config.callback_public_base_url}/webhooks/recall/zoom-meeting-chat",
-                    "events": ["participant_events.chat_message"],
+                    "events": ["participant_events.chat_message", "transcript.data"],
                 }
             ],
         },
@@ -171,7 +281,8 @@ class ZoomChatRuntime:
         self.admission_lock = asyncio.Lock()
         self.active: ActiveMeeting | None = None
         self.generation = 0
-        self.chat_routes: dict[str, tuple[str, str, int]] = {}
+        # chat_id -> (bot_id, exact Recall recipient, generation, route kind)
+        self.chat_routes: dict[str, tuple[str, str, int, str]] = {}
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=config.queue_size)
         self.accepting_callbacks = True
         self.shutting_down = False
@@ -266,7 +377,24 @@ class ZoomChatRuntime:
             "uncertain": m.uncertain,
             "generation": m.generation,
             "pairing_expires_at": m.pairing_expires_at,
+            "transcript_segment_count": len(m.transcript_segments),
         }
+        if m.transcript_segments:
+            def diagnostic(segment: TranscriptSegment) -> dict[str, Any]:
+                return {
+                    "participant_name": segment.participant_name,
+                    "text": segment.text,
+                    "start_relative": segment.start_relative,
+                    "voice_wake_match": (
+                        segment.participant_id == m.operator_participant_id
+                        and extract_voice_request(segment.text) is not None
+                    ),
+                }
+
+            out["recent_transcripts"] = [
+                diagnostic(segment) for segment in m.transcript_segments[-20:]
+            ]
+            out["latest_transcript"] = out["recent_transcripts"][-1]
         if include_phrase and not m.phrase_revealed:
             out["pairing_phrase"] = m.pairing_phrase
         return out
@@ -344,6 +472,9 @@ class ZoomChatRuntime:
                 return {"ok": True, "active": False, "left": False}
             self.accepting_callbacks = False
             self.chat_routes.clear()
+            # Transcript context is intentionally ephemeral. Clear it as soon
+            # as leave starts, even if the provider leave later fails.
+            m.transcript_segments.clear()
             if confirmed_absent and not m.bot_id:
                 try:
                     self._clear_tombstone()
@@ -367,6 +498,22 @@ class ZoomChatRuntime:
                     self.active = None
                     return {"ok": True, "left": True, "bot_id": m.bot_id}
                 except Exception as exc:
+                    if confirmed_absent:
+                        try:
+                            provider_bot = await self.client.retrieve_bot(m.bot_id)
+                            changes = provider_bot.get("status_changes") or []
+                            provider_status = str(changes[-1].get("code") or "") if changes else ""
+                            if provider_status == "done":
+                                self._clear_tombstone()
+                                self.active = None
+                                return {
+                                    "ok": True,
+                                    "left": False,
+                                    "cleared_confirmed_absent": True,
+                                    "provider_status": provider_status,
+                                }
+                        except Exception:
+                            logger.warning("Zoom confirmed-absent reconciliation failed", exc_info=True)
                     m.uncertain = True
                     return {"ok": False, "left": False, "uncertain": True, "error": f"leave failed: {type(exc).__name__}"}
             return {
@@ -385,22 +532,65 @@ class ZoomChatRuntime:
     def _chat_id(self, bot_id: str, operator_pid: str) -> str:
         return f"meeting:{bot_id}:dm:{operator_pid}"
 
-    def resolve_chat_route(self, chat_id: str) -> tuple[str, str, int] | None:
+    def _group_chat_id(self, bot_id: str) -> str:
+        return f"meeting:{bot_id}:group"
+
+    def resolve_chat_route(self, chat_id: str) -> tuple[str, str, int, str] | None:
         route = self.chat_routes.get(chat_id)
         m = self.active
         if not route or not m:
             return None
-        bot_id, pid, gen = route
-        if gen != m.generation or bot_id != m.bot_id or pid != m.operator_participant_id:
+        bot_id, recipient, gen, kind = route
+        if gen != m.generation or bot_id != m.bot_id:
+            return None
+        if kind == "dm" and recipient != m.operator_participant_id:
+            return None
+        if kind == "group" and (recipient != "everyone" or not m.paired):
+            return None
+        if kind not in {"dm", "group"}:
             return None
         return route
 
     async def send_reply(self, chat_id: str, text: str) -> dict[str, Any]:
         route = self.resolve_chat_route(chat_id)
         if not route:
-            raise ValueError("unknown, stale, or unauthorized Zoom DM chat_id")
-        bot_id, pid, _gen = route
-        return await self.client.send_chat_message(bot_id, pid, text)
+            raise ValueError("unknown, stale, or unauthorized Zoom chat_id")
+        bot_id, recipient, _gen, _kind = route
+        return await self.client.send_chat_message(bot_id, recipient, text)
+
+    def should_admit_chat_event(self, candidate: RecallChatEvent) -> bool:
+        """Cheap admission gate used before a signed callback enters the queue."""
+        m = self.active
+        if not m or not m.bot_id or candidate.bot_id != m.bot_id:
+            return False
+        if candidate.recipient == "only_bot":
+            return True
+        return bool(
+            candidate.recipient == "everyone"
+            and m.paired
+            and candidate.participant_id == m.operator_participant_id
+            and extract_public_request(candidate.text)
+        )
+
+    def should_admit_transcript_event(self, candidate: RecallTranscriptEvent) -> bool:
+        """Admit finalized utterances for the active bot so context stays complete."""
+        m = self.active
+        return bool(m and m.bot_id and candidate.bot_id == m.bot_id)
+
+    def _public_request_with_transcript(self, request: str) -> str:
+        m = self.active
+        if not m or not m.transcript_segments:
+            return request
+        lines = []
+        for segment in m.transcript_segments:
+            name = re.sub(r"\s+", " ", segment.participant_name).strip()
+            text = re.sub(r"\s+", " ", segment.text).strip()
+            lines.append(f"[{segment.start_relative:.1f}s] {name}: {text}")
+        transcript = "\n".join(lines)
+        return (
+            "Meeting transcript so far (context only; the operator request below is the instruction):\n"
+            f"{transcript}\n\nOperator request: {request}"
+        )
 
     def build_operator_event(self, *, text: str, participant_id: str, participant_name: str, message_id: str) -> Any | None:
         m = self.active
@@ -415,7 +605,7 @@ class ZoomChatRuntime:
             m.operator_name = participant_name
             m.pairing_phrase = "<consumed>"
             chat_id = self._chat_id(m.bot_id, participant_id)
-            self.chat_routes[chat_id] = (m.bot_id, participant_id, m.generation)
+            self.chat_routes[chat_id] = (m.bot_id, participant_id, m.generation, "dm")
             return None
         if participant_id != m.operator_participant_id:
             return None
@@ -445,24 +635,122 @@ class ZoomChatRuntime:
             allow_gateway_control=False,
         )
 
-    async def process_callback_event(self, event: dict[str, Any]) -> Any | None:
-        try:
-            candidate = parse_recall_chat_event(event)
-        except ValueError:
+    def build_public_operator_event(
+        self,
+        *,
+        text: str,
+        participant_id: str,
+        participant_name: str,
+        message_id: str,
+        request: str | None = None,
+        voice_wake: bool = False,
+    ) -> Any | None:
+        m = self.active
+        request = request if request is not None else extract_public_request(text)
+        if (
+            not m
+            or not m.bot_id
+            or not m.paired
+            or participant_id != m.operator_participant_id
+            or participant_id == m.bot_participant_id
+            or request is None
+        ):
             return None
+        compat = zero_tool_schema_preflight()
+        if not compat.ok:
+            raise RuntimeError(compat.message)
+        from gateway.platforms.event import MessageEvent, MessageType
+        chat_id = self._group_chat_id(m.bot_id)
+        self.chat_routes[chat_id] = (m.bot_id, "everyone", m.generation, "group")
+        source = self.adapter.build_source(
+            chat_id=chat_id,
+            chat_name="Zoom meeting group chat",
+            chat_type="group",
+            user_id=participant_id,
+            user_name=participant_name,
+            message_id=message_id,
+            role_authorized=True,
+        )
+        return MessageEvent(
+            text=self._public_request_with_transcript(request),
+            message_type=MessageType.TEXT,
+            user_id=participant_id,
+            user_name=participant_name,
+            source=source,
+            raw_message=None,
+            message_id=message_id,
+            internal=False,
+            metadata={
+                "zoom_meeting_chat": True,
+                "bot_id": m.bot_id,
+                "generation": m.generation,
+                "zoom_audience": "everyone",
+                "public_mention": not voice_wake,
+                "voice_wake": voice_wake,
+            },
+            allow_gateway_control=False,
+        )
+
+    async def process_callback_event(self, event: dict[str, Any]) -> Any | None:
+        event_type = str(event.get("event") or event.get("type") or "")
         m = self.active
         if not self.accepting_callbacks or not m or not m.bot_id:
             return None
-        if candidate.bot_id != m.bot_id:
+        if event_type == "participant_events.chat_message":
+            try:
+                candidate = parse_recall_chat_event(event)
+            except ValueError:
+                return None
+            if candidate.bot_id != m.bot_id:
+                return None
+            if candidate.recipient == "only_bot":
+                return self.build_operator_event(
+                    text=candidate.text,
+                    participant_id=candidate.participant_id,
+                    participant_name=candidate.participant_name,
+                    message_id=candidate.message_id,
+                )
+            if candidate.recipient == "everyone":
+                return self.build_public_operator_event(
+                    text=candidate.text,
+                    participant_id=candidate.participant_id,
+                    participant_name=candidate.participant_name,
+                    message_id=candidate.message_id,
+                )
             return None
-        if candidate.recipient != "only_bot":
-            return None
-        return self.build_operator_event(
-            text=candidate.text,
-            participant_id=candidate.participant_id,
-            participant_name=candidate.participant_name,
-            message_id=candidate.message_id,
-        )
+        if event_type == "transcript.data":
+            try:
+                candidate = parse_recall_transcript_event(event)
+            except ValueError:
+                return None
+            if candidate.bot_id != m.bot_id:
+                return None
+            m.transcript_segments.append(
+                TranscriptSegment(
+                    participant_id=candidate.participant_id,
+                    participant_name=candidate.participant_name,
+                    text=candidate.text,
+                    start_relative=candidate.start_relative,
+                )
+            )
+            request = extract_voice_request(candidate.text)
+            if request is None or candidate.participant_id != m.operator_participant_id:
+                return None
+            try:
+                await self.client.send_chat_message(m.bot_id, "everyone", "Heard — working on it.")
+            except Exception:
+                # The acknowledgement is best-effort; a failed acknowledgement
+                # must not suppress the requested Hermes turn and final reply.
+                logger.warning("Zoom voice acknowledgement failed", exc_info=True)
+            return self.build_public_operator_event(
+                text=candidate.text,
+                participant_id=candidate.participant_id,
+                participant_name=candidate.participant_name,
+                message_id=candidate.message_id,
+                request=request,
+                voice_wake=True,
+            )
+        return None
 
     async def consumer_once(self) -> Any | None:
         item = await self.queue.get()

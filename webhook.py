@@ -10,10 +10,12 @@ from typing import Any, Mapping
 
 from gateway.platforms.helpers import MessageDeduplicator
 
-from .runtime import parse_recall_chat_event
+from .runtime import parse_recall_chat_event, parse_recall_transcript_event
 
 MAX_BODY_BYTES = 64 * 1024
-ACCEPTED_EVENT = "participant_events.chat_message"
+CHAT_EVENT = "participant_events.chat_message"
+TRANSCRIPT_EVENT = "transcript.data"
+ACCEPTED_EVENTS = {CHAT_EVENT, TRANSCRIPT_EVENT}
 
 
 @dataclass
@@ -90,22 +92,29 @@ class RecallWebhookReceiver:
         except Exception as exc:
             return WebhookAdmission(400, str(exc))
         event_type = str(payload.get("event") or payload.get("type") or "")
-        if event_type != ACCEPTED_EVENT:
+        if event_type not in ACCEPTED_EVENTS:
             return WebhookAdmission(204, "")
         payload["webhook_id"] = wid
         try:
-            candidate = parse_recall_chat_event(payload)
+            if event_type == CHAT_EVENT:
+                candidate = parse_recall_chat_event(payload)
+            else:
+                candidate = parse_recall_transcript_event(payload)
         except ValueError as exc:
             return WebhookAdmission(400, str(exc))
         async with self.runtime.admission_lock:
             active = self.runtime.active
+            if event_type == CHAT_EVENT:
+                admitted = self.runtime.should_admit_chat_event(candidate)
+            else:
+                admitted = self.runtime.should_admit_transcript_event(candidate)
             if (
                 not self.runtime.accepting_callbacks
                 or self.runtime.shutting_down
                 or active is None
                 or not active.bot_id
                 or candidate.bot_id != active.bot_id
-                or candidate.recipient != "only_bot"
+                or not admitted
             ):
                 return WebhookAdmission(204, "")
             if self.dedup.contains(wid):

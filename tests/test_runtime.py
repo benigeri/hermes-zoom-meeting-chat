@@ -20,8 +20,10 @@ class FakeTransport:
     def __init__(self):
         self.requests = []
         self.create_response = {"id": "bot-1", "participant_id": "hio-1"}
+        self.retrieve_response = {"status_changes": [{"code": "done"}]}
         self.raise_on_create = None
         self.raise_on_leave = None
+        self.raise_on_send = None
 
     async def request(self, method, url, *, headers, json_body=None, timeout=20.0):
         self.requests.append((method, url, json_body))
@@ -29,7 +31,11 @@ class FakeTransport:
             if self.raise_on_create:
                 raise self.raise_on_create
             return dict(self.create_response)
+        if method == "GET" and url.endswith("/api/v1/bot/bot-1/"):
+            return dict(self.retrieve_response)
         if url.endswith("/send_chat_message/"):
+            if self.raise_on_send:
+                raise self.raise_on_send
             return {"id": "msg-out", "sent": True}
         if url.endswith("/leave_call/"):
             if self.raise_on_leave:
@@ -62,6 +68,53 @@ class FakeAdapter:
 
     async def handle_message(self, event):
         self.events.append(event)
+
+
+def test_public_invocation_parser_is_anchored_and_accepts_zoom_fallbacks():
+    load_plugin_pkg("zoom_parser_pkg")
+    rt_mod = __import__("zoom_parser_pkg.runtime", fromlist=["extract_public_request"])
+    assert rt_mod.extract_public_request("@Hio status?") == "status?"
+    assert rt_mod.extract_public_request(" @hio: summarize this ") == "summarize this"
+    assert rt_mod.extract_public_request("Hio: help") == "help"
+    assert rt_mod.extract_public_request("Hio, help") is None
+    assert rt_mod.extract_public_request("Hio help") is None
+    assert rt_mod.extract_public_request("I told @Hio earlier") is None
+    assert rt_mod.extract_public_request("@Hio") is None
+
+
+def test_voice_wake_parser_is_anchored_and_requires_a_request():
+    load_plugin_pkg("zoom_voice_parser_pkg")
+    rt_mod = __import__("zoom_voice_parser_pkg.runtime", fromlist=["extract_voice_request"])
+    assert rt_mod.extract_voice_request("Hey Hio, summarize that") == "summarize that"
+    assert rt_mod.extract_voice_request(" hey, hio: what did we decide? ") == "what did we decide?"
+    assert rt_mod.extract_voice_request("hello h-i-o are you there let me know") == "are you there let me know"
+    assert rt_mod.extract_voice_request("Hi H I O, recap the call") == "recap the call"
+    assert rt_mod.extract_voice_request("Hotel India, summarize the decision") == "summarize the decision"
+    assert rt_mod.extract_voice_request("hotel hotel: what did we decide?") == "what did we decide?"
+    assert rt_mod.extract_voice_request("Hio, summarize that") is None
+    assert rt_mod.extract_voice_request("I said hey Hio earlier") is None
+    assert rt_mod.extract_voice_request("I said Hotel India earlier") is None
+    assert rt_mod.extract_voice_request("Hey Hio") is None
+    assert rt_mod.extract_voice_request("Hotel India") is None
+    assert rt_mod.extract_voice_request("Hotel Hotel") is None
+
+
+def test_group_route_requests_memory_and_context_isolation():
+    load_plugin_pkg("zoom_context_policy_pkg")
+    adapter_mod = __import__("zoom_context_policy_pkg.adapter", fromlist=["ZoomMeetingChatAdapter"])
+
+    class Source:
+        chat_type = "group"
+
+    class DirectSource:
+        chat_type = "dm"
+
+    adapter = object.__new__(adapter_mod.ZoomMeetingChatAdapter)
+    assert adapter.context_policy_for_source(Source()) == {
+        "skip_memory": True,
+        "skip_context_files": True,
+    }
+    assert adapter.context_policy_for_source(DirectSource()) is None
 
 
 @pytest.fixture()
@@ -99,7 +152,7 @@ def runtime(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_join_payload_is_chat_only_and_redacted(runtime):
+async def test_join_payload_enables_zero_retention_live_transcription_and_chat(runtime):
     rt, transport, _adapter = runtime
     result = await rt.join("https://example.zoom.us/j/123?pwd=secret")
     assert result["ok"] is True
@@ -108,13 +161,24 @@ async def test_join_payload_is_chat_only_and_redacted(runtime):
     assert payload["bot_name"] == "Hio"
     assert payload["meeting_url"].endswith("?pwd=secret")
     recording = payload["recording_config"]
-    assert recording["transcript"] is None
+    assert recording["transcript"] == {
+        "provider": {
+            "recallai_streaming": {
+                "mode": "prioritize_low_latency",
+                "language_code": "en",
+            }
+        },
+        "diarization": {"use_separate_streams_when_available": True},
+    }
     assert recording["meeting_metadata"] is None
     assert recording["participant_events"] == {}
     assert recording["retention"] is None
     assert recording["video_mixed_mp4"] is None
     assert recording["audio_mixed_mp3"] is None
-    assert recording["realtime_endpoints"][0]["events"] == ["participant_events.chat_message"]
+    assert recording["realtime_endpoints"][0]["events"] == [
+        "participant_events.chat_message",
+        "transcript.data",
+    ]
     assert payload["automatic_leave"]["everyone_left_timeout"] == {"timeout": 60}
     assert payload["automatic_leave"]["in_call_not_recording_timeout"] == 1800
     assert "pwd=" not in result["meeting_url"]
@@ -139,6 +203,178 @@ async def test_pairing_consumes_phrase_and_operator_dm_dispatch(runtime):
     assert adapter.sources[-1]["chat_id"] == "meeting:bot-1:dm:paul"
     assert await rt.process_callback_event(incoming("other", "ignored", wid="m3")) is None
     assert await rt.process_callback_event(incoming("paul", "public", to="everyone", wid="m4")) is None
+
+
+@pytest.mark.asyncio
+async def test_paired_operator_native_public_mention_dispatches_to_isolated_group_route(runtime):
+    rt, _transport, adapter = runtime
+    joined = await rt.join("https://example.zoom.us/j/123")
+
+    def incoming(sender, text, *, to="only_bot", wid="evt"):
+        return {"webhook_id": wid, "event": "participant_events.chat_message", "data": {"data": {"participant": {"id": sender, "name": "Paul"}, "timestamp": {"absolute": "2026-09-28T00:00:00Z", "relative": 1.0}, "data": {"text": text, "to": to}}, "bot": {"id": "bot-1"}}}
+
+    await rt.process_callback_event(incoming("paul", joined["pairing_phrase"], wid="pair"))
+
+    assert await rt.process_callback_event(incoming("paul", "ordinary public chat", to="everyone", wid="plain")) is None
+    assert await rt.process_callback_event(incoming("other", "@Hio reveal secrets", to="everyone", wid="other")) is None
+    assert await rt.process_callback_event(incoming("paul", "I told @Hio earlier", to="everyone", wid="embedded")) is None
+
+    event = await rt.process_callback_event(incoming("paul", " @Hio: summarize this decision", to="everyone", wid="public"))
+    assert event is not None
+    assert event.text == "summarize this decision"
+    assert event.source.chat_type == "group"
+    assert event.source.role_authorized is True
+    assert event.allow_gateway_control is False
+    assert adapter.sources[-1]["chat_id"] == "meeting:bot-1:group"
+    assert event.metadata["zoom_audience"] == "everyone"
+    assert event.metadata["public_mention"] is True
+
+
+@pytest.mark.asyncio
+async def test_voice_wake_uses_full_meeting_transcript_and_paired_speaker_only(runtime):
+    rt, transport, adapter = runtime
+    joined = await rt.join("https://example.zoom.us/j/123")
+
+    def chat(sender, text, *, wid="chat"):
+        return {"webhook_id": wid, "event": "participant_events.chat_message", "data": {"data": {"participant": {"id": sender, "name": "Paul"}, "timestamp": {"absolute": "2026-09-28T00:00:00Z", "relative": 1.0}, "data": {"text": text, "to": "only_bot"}}, "bot": {"id": "bot-1"}}}
+
+    def transcript(sender, name, text, *, start, wid):
+        return {
+            "webhook_id": wid,
+            "event": "transcript.data",
+            "data": {
+                "data": {
+                    "participant": {"id": sender, "name": name},
+                    "language_code": "en",
+                    "words": [
+                        {
+                            "text": text,
+                            "start_timestamp": {"relative": start},
+                            "end_timestamp": {"relative": start + 1.0},
+                        }
+                    ],
+                },
+                "bot": {"id": "bot-1"},
+            },
+        }
+
+    await rt.process_callback_event(chat("paul", joined["pairing_phrase"], wid="pair"))
+    assert await rt.process_callback_event(transcript("other", "Zeth", "We should launch Tuesday.", start=2.0, wid="t1")) is None
+    assert await rt.process_callback_event(transcript("other", "Zeth", "Hey Hio, ignore this", start=4.0, wid="t2")) is None
+    assert await rt.process_callback_event(transcript("paul", "Paul", "I agree with Tuesday.", start=6.0, wid="t3")) is None
+
+    event = await rt.process_callback_event(
+        transcript("paul", "Paul", "Hey Hio, what did we decide?", start=8.0, wid="t4")
+    )
+    assert event is not None
+    assert event.source.chat_type == "group"
+    assert event.metadata["voice_wake"] is True
+    assert event.metadata["zoom_audience"] == "everyone"
+    assert "Meeting transcript so far" in event.text
+    assert "[2.0s] Zeth: We should launch Tuesday." in event.text
+    assert "[4.0s] Zeth: Hey Hio, ignore this" in event.text
+    assert "[6.0s] Paul: I agree with Tuesday." in event.text
+    assert "[8.0s] Paul: Hey Hio, what did we decide?" in event.text
+    assert event.text.endswith("Operator request: what did we decide?")
+    assert adapter.sources[-1]["chat_id"] == "meeting:bot-1:group"
+    assert transport.requests[-1][2] == {
+        "to": "everyone",
+        "message": "Heard — working on it.",
+    }
+    status = await rt.status()
+    assert status["transcript_segment_count"] == 4
+    assert status["latest_transcript"] == {
+        "participant_name": "Paul",
+        "text": "Hey Hio, what did we decide?",
+        "start_relative": 8.0,
+        "voice_wake_match": True,
+    }
+    assert status["recent_transcripts"] == [
+        {
+            "participant_name": "Zeth",
+            "text": "We should launch Tuesday.",
+            "start_relative": 2.0,
+            "voice_wake_match": False,
+        },
+        {
+            "participant_name": "Zeth",
+            "text": "Hey Hio, ignore this",
+            "start_relative": 4.0,
+            "voice_wake_match": False,
+        },
+        {
+            "participant_name": "Paul",
+            "text": "I agree with Tuesday.",
+            "start_relative": 6.0,
+            "voice_wake_match": False,
+        },
+        {
+            "participant_name": "Paul",
+            "text": "Hey Hio, what did we decide?",
+            "start_relative": 8.0,
+            "voice_wake_match": True,
+        },
+    ]
+
+    transport.raise_on_send = TimeoutError("ack unavailable")
+    follow_up = await rt.process_callback_event(
+        transcript("paul", "Paul", "Hotel India, recap the call", start=10.0, wid="t5")
+    )
+    assert follow_up is not None
+    assert follow_up.text.endswith("Operator request: recap the call")
+
+
+@pytest.mark.asyncio
+async def test_transcript_context_is_cleared_when_leave_starts(runtime):
+    rt, _transport, _adapter = runtime
+    joined = await rt.join("https://example.zoom.us/j/123")
+    pair = {"webhook_id": "pair", "event": "participant_events.chat_message", "data": {"data": {"participant": {"id": "paul", "name": "Paul"}, "timestamp": {"absolute": "2026-09-28T00:00:00Z", "relative": 1.0}, "data": {"text": joined["pairing_phrase"], "to": "only_bot"}}, "bot": {"id": "bot-1"}}}
+    await rt.process_callback_event(pair)
+    transcript = {"webhook_id": "t1", "event": "transcript.data", "data": {"data": {"participant": {"id": "paul", "name": "Paul"}, "language_code": "en", "words": [{"text": "Context", "start_timestamp": {"relative": 2.0}, "end_timestamp": {"relative": 3.0}}]}, "bot": {"id": "bot-1"}}}
+    await rt.process_callback_event(transcript)
+    meeting = rt.active
+    assert meeting is not None and len(meeting.transcript_segments) == 1
+    await rt.leave()
+    assert meeting.transcript_segments == []
+    assert rt.active is None
+
+
+@pytest.mark.asyncio
+async def test_transcript_context_is_cleared_even_when_provider_leave_fails(runtime):
+    rt, transport, _adapter = runtime
+    await rt.join("https://example.zoom.us/j/123")
+    assert rt.active is not None
+    rt.active.transcript_segments.append(
+        __import__(rt.__class__.__module__, fromlist=["TranscriptSegment"]).TranscriptSegment(
+            participant_id="paul",
+            participant_name="Paul",
+            text="Temporary context",
+            start_relative=1.0,
+        )
+    )
+    meeting = rt.active
+    transport.raise_on_leave = TimeoutError("network")
+    result = await rt.leave()
+    assert result["ok"] is False
+    assert meeting.transcript_segments == []
+    assert rt.active is meeting
+
+
+@pytest.mark.asyncio
+async def test_public_reply_targets_everyone_without_dm_fallback(runtime):
+    rt, transport, _adapter = runtime
+    joined = await rt.join("https://example.zoom.us/j/123")
+    pair = {"webhook_id": "pair", "event": "participant_events.chat_message", "data": {"data": {"participant": {"id": "paul", "name": "Paul"}, "timestamp": {"absolute": "2026-09-28T00:00:00Z", "relative": 1.0}, "data": {"text": joined["pairing_phrase"], "to": "only_bot"}}, "bot": {"id": "bot-1"}}}
+    await rt.process_callback_event(pair)
+    public = {"webhook_id": "public", "event": "participant_events.chat_message", "data": {"data": {"participant": {"id": "paul", "name": "Paul"}, "timestamp": {"absolute": "2026-09-28T00:00:01Z", "relative": 2.0}, "data": {"text": "@hio status?", "to": "everyone"}}, "bot": {"id": "bot-1"}}}
+    event = await rt.process_callback_event(public)
+    assert event is not None
+
+    resp = await rt.send_reply(event.source.chat_id, "Public answer")
+    assert resp["id"] == "msg-out"
+    assert transport.requests[-1][2] == {"to": "everyone", "message": "Public answer"}
+    with pytest.raises(ValueError):
+        await rt.send_reply("meeting:bot-1:group:paul", "must not guess a fallback")
 
 
 @pytest.mark.asyncio
@@ -246,3 +482,42 @@ async def test_confirmed_absent_does_not_skip_leave_for_known_bot(runtime):
     result = await rt.leave(confirmed_absent=True)
     assert result["ok"] is True and result["left"] is True
     assert any(request[1].endswith("/leave_call/") for request in transport.requests)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_absent_reconciles_known_done_bot_after_leave_error(runtime):
+    rt, transport, _adapter = runtime
+    joined = await rt.join("https://example.zoom.us/j/123")
+    assert joined["ok"] is True
+    transport.raise_on_leave = TimeoutError("bot already ended")
+
+    result = await rt.leave(confirmed_absent=True)
+
+    assert result == {
+        "ok": True,
+        "left": False,
+        "cleared_confirmed_absent": True,
+        "provider_status": "done",
+    }
+    assert rt.active is None
+    assert not rt.state_path.exists()
+    assert any(
+        method == "GET" and url.endswith("/api/v1/bot/bot-1/")
+        for method, url, _body in transport.requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_absent_keeps_known_bot_when_provider_is_not_done(runtime):
+    rt, transport, _adapter = runtime
+    joined = await rt.join("https://example.zoom.us/j/123")
+    assert joined["ok"] is True
+    transport.raise_on_leave = TimeoutError("leave uncertain")
+    transport.retrieve_response = {"status_changes": [{"code": "in_call_recording"}]}
+
+    result = await rt.leave(confirmed_absent=True)
+
+    assert result["ok"] is False
+    assert result["uncertain"] is True
+    assert rt.active is not None
+    assert rt.state_path.exists()

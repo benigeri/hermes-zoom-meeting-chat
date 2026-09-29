@@ -14,8 +14,9 @@ from conftest import load_plugin_pkg
 
 
 def signed(secret: str, wid: str, ts: int, body: bytes):
-    wh = __import__("zoom_webhook_pkg.webhook", fromlist=["_secret_bytes"])
-    digest = hmac.new(wh._secret_bytes(secret), f"{wid}.{ts}.".encode() + body, hashlib.sha256).digest()
+    raw = secret.removeprefix("whsec_")
+    key = base64.b64decode(raw + "=" * (-len(raw) % 4), validate=True)
+    digest = hmac.new(key, f"{wid}.{ts}.".encode() + body, hashlib.sha256).digest()
     return {"webhook-id": wid, "webhook-timestamp": str(ts), "webhook-signature": "v1," + base64.b64encode(digest).decode()}
 
 
@@ -30,6 +31,7 @@ async def test_hmac_admission_dedup_and_queue_full():
         active=SimpleNamespace(bot_id="bot-1"),
         accepting_callbacks=True,
         shutting_down=False,
+        should_admit_chat_event=lambda candidate: candidate.recipient == "only_bot",
     )
     receiver = wh.RecallWebhookReceiver(runtime)
     now = int(time.time())
@@ -60,6 +62,7 @@ async def test_signed_irrelevant_or_malformed_events_never_consume_queue_or_dedu
         active=SimpleNamespace(bot_id="bot-1"),
         accepting_callbacks=True,
         shutting_down=False,
+        should_admit_chat_event=lambda candidate: candidate.recipient == "only_bot",
     )
     receiver = wh.RecallWebhookReceiver(runtime)
     now = int(time.time())
@@ -84,18 +87,117 @@ async def test_signed_irrelevant_or_malformed_events_never_consume_queue_or_dedu
     assert runtime.queue.qsize() == 1
 
 
+@pytest.mark.asyncio
+async def test_signed_public_mention_is_admitted_only_when_runtime_authorizes_it():
+    load_plugin_pkg("zoom_webhook_public_pkg")
+    wh = __import__("zoom_webhook_public_pkg.webhook", fromlist=["RecallWebhookReceiver"])
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(webhook_secret="whsec_dGVzdA", webhook_replay_window_seconds=300),
+        queue=asyncio.Queue(maxsize=2),
+        admission_lock=asyncio.Lock(),
+        active=SimpleNamespace(bot_id="bot-1"),
+        accepting_callbacks=True,
+        shutting_down=False,
+        should_admit_chat_event=lambda candidate: (
+            candidate.recipient == "everyone"
+            and candidate.participant_id == "paul"
+            and candidate.text.lower().lstrip().startswith("@hio")
+        ),
+    )
+    receiver = wh.RecallWebhookReceiver(runtime)
+    now = int(time.time())
+
+    def body_for(participant, text):
+        return json.dumps({"event": "participant_events.chat_message", "data": {"data": {"participant": {"id": participant, "name": "Paul"}, "timestamp": {"absolute": "2026-09-28T00:00:00Z", "relative": 1.0}, "data": {"text": text, "to": "everyone"}}, "bot": {"id": "bot-1"}}}).encode()
+
+    for wid, participant, text, expected in (
+        ("plain", "paul", "ordinary public chat", 204),
+        ("other", "other", "@Hio private info", 204),
+        ("mention", "paul", "@Hio status?", 202),
+    ):
+        body = body_for(participant, text)
+        result = await receiver.admit(
+            method="POST",
+            content_type="application/json",
+            headers=signed(runtime.config.webhook_secret, wid, now, body),
+            raw_body=body,
+        )
+        assert result.status == expected
+
+    assert runtime.queue.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_signed_final_transcript_is_admitted_and_malformed_transcript_is_rejected():
+    load_plugin_pkg("zoom_webhook_transcript_pkg")
+    wh = __import__("zoom_webhook_transcript_pkg.webhook", fromlist=["RecallWebhookReceiver"])
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(webhook_secret="whsec_dGVzdA", webhook_replay_window_seconds=300),
+        queue=asyncio.Queue(maxsize=2),
+        admission_lock=asyncio.Lock(),
+        active=SimpleNamespace(bot_id="bot-1"),
+        accepting_callbacks=True,
+        shutting_down=False,
+        should_admit_chat_event=lambda _candidate: False,
+        should_admit_transcript_event=lambda candidate: candidate.bot_id == "bot-1",
+    )
+    receiver = wh.RecallWebhookReceiver(runtime)
+    now = int(time.time())
+
+    def body_for(*, bot="bot-1", participant="paul", words=None):
+        if words is None:
+            words = [{"text": "Hey Hio, summarize", "start_timestamp": {"relative": 1.0}, "end_timestamp": {"relative": 2.0}}]
+        return json.dumps({"event": "transcript.data", "data": {"data": {"participant": {"id": participant, "name": "Paul"}, "language_code": "en", "words": words}, "bot": {"id": bot}}}).encode()
+
+    valid = body_for()
+    accepted = await receiver.admit(
+        method="POST",
+        content_type="application/json",
+        headers=signed(runtime.config.webhook_secret, "transcript-1", now, valid),
+        raw_body=valid,
+    )
+    assert accepted.status == 202
+
+    malformed = body_for(words=[])
+    rejected = await receiver.admit(
+        method="POST",
+        content_type="application/json",
+        headers=signed(runtime.config.webhook_secret, "transcript-2", now, malformed),
+        raw_body=malformed,
+    )
+    assert rejected.status == 400
+    assert runtime.queue.qsize() == 1
+
+
 def test_compatibility_preflight_success_and_failures(monkeypatch):
     load_plugin_pkg("zoom_compat_pkg")
     compat = __import__("zoom_compat_pkg.compat", fromlist=["zero_tool_schema_preflight"])
     monkeypatch.setattr("hermes_cli.tools_config._get_plugin_toolset_keys", lambda: {"zoom_meeting_chat_admin"})
     monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda cfg, platform: set() if cfg["platform_toolsets"][platform] == ["no_mcp"] else {"bad"})
-    monkeypatch.setattr("model_tools.get_tool_definitions", lambda enabled_toolsets=None, quiet_mode=True: [])
+    monkeypatch.setattr(
+        "model_tools.get_tool_definitions",
+        lambda enabled_toolsets=None, quiet_mode=True, skip_tool_search_assembly=False: [],
+    )
     ok = compat.zero_tool_schema_preflight({"known_plugin_toolsets": {"zoom_meeting_chat": ["zoom_meeting_chat_admin"]}})
     assert ok.ok is True
     missing = compat.zero_tool_schema_preflight({"known_plugin_toolsets": {"zoom_meeting_chat": []}})
     assert missing.ok is False and "known_plugin_toolsets" in missing.message
     nondefault_context = compat.zero_tool_schema_preflight({"context": {"engine": "lcm"}, "known_plugin_toolsets": {"zoom_meeting_chat": ["zoom_meeting_chat_admin"]}})
     assert nondefault_context.ok is False and "context.engine" in nondefault_context.message
-    monkeypatch.setattr("model_tools.get_tool_definitions", lambda enabled_toolsets=None, quiet_mode=True: [{"function": {"name": "x_search"}}])
+    def bridge_only(enabled_toolsets=None, quiet_mode=True, skip_tool_search_assembly=False):
+        names = ["x_search"] if skip_tool_search_assembly else ["tool_search", "tool_describe", "tool_call"]
+        return [{"function": {"name": name}} for name in names]
+
+    monkeypatch.setattr("model_tools.get_tool_definitions", bridge_only)
+    bridge = compat.zero_tool_schema_preflight(
+        {"known_plugin_toolsets": {"zoom_meeting_chat": ["zoom_meeting_chat_admin"]}}
+    )
+    assert bridge.ok is True
+
+    def leaked_tool(enabled_toolsets=None, quiet_mode=True, skip_tool_search_assembly=False):
+        names = ["terminal"] if skip_tool_search_assembly else ["terminal"]
+        return [{"function": {"name": name}} for name in names]
+
+    monkeypatch.setattr("model_tools.get_tool_definitions", leaked_tool)
     leak = compat.zero_tool_schema_preflight({"known_plugin_toolsets": {"zoom_meeting_chat": ["zoom_meeting_chat_admin"]}})
-    assert leak.ok is False and "zero final model tool schemas" in leak.message
+    assert leak.ok is False and "unsupported model tool schemas" in leak.message

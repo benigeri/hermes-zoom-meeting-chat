@@ -56,6 +56,14 @@ class RecallClient:
         assert self.transport is not None
         return await self.transport.request("POST", f"{self.base_url}/api/v1/bot/", headers=self._headers, json_body=payload)
 
+    async def retrieve_bot(self, bot_id: str) -> dict[str, Any]:
+        assert self.transport is not None
+        return await self.transport.request(
+            "GET",
+            f"{self.base_url}/api/v1/bot/{bot_id}/",
+            headers=self._headers,
+        )
+
     async def send_chat_message(self, bot_id: str, participant_id: str, text: str) -> dict[str, Any]:
         assert self.transport is not None
         payload = {"to": participant_id, "message": text}

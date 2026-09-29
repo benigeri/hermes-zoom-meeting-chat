@@ -80,10 +80,18 @@ class ZoomMeetingChatAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc), error_kind="forbidden")
 
     async def get_chat_info(self, chat_id):
+        if str(chat_id).endswith(":group"):
+            return {"name": "Zoom meeting group chat", "type": "group"}
         return {"name": "Zoom Meeting Chat DM", "type": "dm"}
 
     def toolsets_for_source(self, source):
         return ["no_mcp"]
+
+    def context_policy_for_source(self, source):
+        """Keep public meeting turns outside private profile context."""
+        if getattr(source, "chat_type", None) == "group":
+            return {"skip_memory": True, "skip_context_files": True}
+        return None
 
 
 def _env_enablement() -> dict | None:
@@ -103,6 +111,15 @@ def register(ctx) -> None:
         env_enablement_fn=_env_enablement,
         install_hint="Set RECALL_API_KEY, RECALL_WEBHOOK_SECRET, and platform extra callback_public_base_url. The plugin stays disabled/unconfigured without credentials.",
         max_message_length=4000,
-        platform_hint="Zoom Meeting Chat is a private direct-message-only meeting surface. Never address the public meeting room.",
+        platform_hint=(
+            "Zoom Meeting Chat has two isolated routes. Direct messages are private. "
+            "A group route is created only when the paired operator starts a public message with "
+            "@Hio (or Hio: if Zoom strips the mention marker), or starts a finalized spoken utterance with "
+            "Hotel India, Hotel Hotel, or a compatible Hey Hio form; replies on that route are visible to everyone. "
+            "The group turn includes the live meeting transcript so far. "
+            "For group replies, use only the operator request and meeting transcript: do not reveal or rely on "
+            "personal memory, private Zoom DM history, credentials, local paths, or private-source facts. "
+            "Never fall back between private and public audiences."
+        ),
         emoji="🎥",
     )
