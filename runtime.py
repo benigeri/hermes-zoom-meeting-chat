@@ -47,6 +47,8 @@ class ActiveMeeting:
     uncertain: bool = False
     created_at: float = field(default_factory=time.time)
     transcript_segments: list[TranscriptSegment] = field(default_factory=list)
+    pending_voice_wake_participant_id: str | None = None
+    pending_voice_wake_start_relative: float | None = None
 
     @property
     def paired(self) -> bool:
@@ -87,6 +89,15 @@ _VOICE_WAKE_RE = re.compile(
     r")\s*[:,]?\s+(?P<request>\S(?:.*\S)?)\s*$",
     re.IGNORECASE,
 )
+_VOICE_WAKE_ONLY_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:hey|hello|hi)\s*,?\s+h[\s.-]*i[\s.-]*o"
+    r"|hotel\s+(?:india|hotel)"
+    r"|hotel"
+    r")\s*[:,]?\s*$",
+    re.IGNORECASE,
+)
+_VOICE_WAKE_FOLLOW_UP_SECONDS = 3.0
 
 
 def extract_public_request(text: str) -> str | None:
@@ -105,6 +116,16 @@ def extract_voice_request(text: str) -> str | None:
     """Return the request from an anchored finalized voice invocation."""
     match = _VOICE_WAKE_RE.match(text or "")
     return match.group("request") if match else None
+
+
+def is_voice_wake_only(text: str) -> bool:
+    """Return whether a finalized segment is only a supported wake phrase.
+
+    Recall often finalizes the wake phrase and command as adjacent segments.
+    A standalone ``hotel`` is accepted only in this armed form because Recall
+    dropped the second NATO word in live tests; it is never a direct command.
+    """
+    return _VOICE_WAKE_ONLY_RE.match(text or "") is not None
 
 
 def parse_recall_chat_event(event: dict[str, Any]) -> RecallChatEvent:
@@ -387,7 +408,10 @@ class ZoomChatRuntime:
                     "start_relative": segment.start_relative,
                     "voice_wake_match": (
                         segment.participant_id == m.operator_participant_id
-                        and extract_voice_request(segment.text) is not None
+                        and (
+                            extract_voice_request(segment.text) is not None
+                            or is_voice_wake_only(segment.text)
+                        )
                     ),
                 }
 
@@ -502,8 +526,23 @@ class ZoomChatRuntime:
                         try:
                             provider_bot = await self.client.retrieve_bot(m.bot_id)
                             changes = provider_bot.get("status_changes") or []
-                            provider_status = str(changes[-1].get("code") or "") if changes else ""
-                            if provider_status == "done":
+                            provider_statuses = [
+                                str(change.get("code") or "")
+                                for change in changes
+                                if isinstance(change, dict)
+                            ]
+                            provider_status = provider_statuses[-1] if provider_statuses else ""
+                            # Recall can advance an already-absent bot beyond
+                            # `done` to `media_expired`. Earlier terminal events
+                            # remain authoritative even when artifact states
+                            # are appended later.
+                            absent_statuses = {
+                                "call_ended",
+                                "done",
+                                "fatal",
+                                "media_expired",
+                            }
+                            if absent_statuses.intersection(provider_statuses):
                                 self._clear_tombstone()
                                 self.active = None
                                 return {
@@ -733,9 +772,32 @@ class ZoomChatRuntime:
                     start_relative=candidate.start_relative,
                 )
             )
-            request = extract_voice_request(candidate.text)
-            if request is None or candidate.participant_id != m.operator_participant_id:
+            if candidate.participant_id != m.operator_participant_id:
                 return None
+            request = extract_voice_request(candidate.text)
+            if request is not None:
+                m.pending_voice_wake_participant_id = None
+                m.pending_voice_wake_start_relative = None
+            elif is_voice_wake_only(candidate.text):
+                m.pending_voice_wake_participant_id = candidate.participant_id
+                m.pending_voice_wake_start_relative = candidate.start_relative
+                return None
+            else:
+                pending_start = m.pending_voice_wake_start_relative
+                pending_matches = (
+                    m.pending_voice_wake_participant_id == candidate.participant_id
+                    and pending_start is not None
+                    and 0.0
+                    <= candidate.start_relative - pending_start
+                    <= _VOICE_WAKE_FOLLOW_UP_SECONDS
+                )
+                m.pending_voice_wake_participant_id = None
+                m.pending_voice_wake_start_relative = None
+                if not pending_matches:
+                    return None
+                request = candidate.text.strip()
+                if not request:
+                    return None
             try:
                 await self.client.send_chat_message(m.bot_id, "everyone", "Heard — working on it.")
             except Exception:

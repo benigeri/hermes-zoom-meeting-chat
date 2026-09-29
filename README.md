@@ -1,12 +1,13 @@
 # Hermes Zoom Meeting Chat
 
-Standalone Hermes platform plugin for a narrow v0.5 Zoom meeting-chat, voice-command, and calendar auto-join flow backed by Recall.ai.
+Standalone Hermes platform plugin for a narrow v0.5.2 Zoom meeting-chat, voice-command, and calendar auto-join flow backed by Recall.ai.
 
 - One active meeting per Hermes profile
 - One visible Zoom participant named `Hio`
 - One paired operator, authorized by a one-use direct-message pairing phrase
 - Private Zoom DMs plus a public group route invoked by the paired operator with native `@Hio`
 - Finalized `Hotel India …`, `Hotel Hotel …`, or compatible `Hey Hio …` speech from the paired operator invokes the same public route
+- If Recall splits the wake phrase from its command, the paired speaker's next finalized segment is accepted for three seconds; a standalone `hotel` only arms this bounded fallback
 - Voice invocations receive an immediate public acknowledgement, then one complete public answer
 - Finalized speech from all participants is kept in memory as meeting context until leave begins
 - Other participants cannot invoke Hio; ordinary group-chat messages are ignored

@@ -1,7 +1,7 @@
 name: zoom_meeting_chat-platform
 label: Zoom Meeting Chat
 kind: platform
-version: 0.5.0
+version: 0.5.2
 description: Calendar-aware paired DM, public @Hio, and Hotel India / Hotel Hotel voice-command Zoom platform for Hermes, backed by Recall.ai.
 author: Paul Benigeri
 license: MIT
