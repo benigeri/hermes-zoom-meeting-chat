@@ -42,9 +42,11 @@ def _load_sibling(module: str):
 
 
 try:
+    from .calendar_auto_join import resolve_event_for_join
     from .config import ADMIN_TOOLSET
     from .runtime import get_runtime
 except ImportError:  # bare tools.py import during deferred tool discovery
+    resolve_event_for_join = _load_sibling("calendar_auto_join").resolve_event_for_join
     ADMIN_TOOLSET = _load_sibling("config").ADMIN_TOOLSET
     get_runtime = _load_sibling("runtime").get_runtime
 
@@ -69,6 +71,23 @@ def zoom_chat_join(args: dict[str, Any], **_: Any) -> str:
     if not meeting_url:
         return _json({"ok": False, "error": "meeting_url is required"})
     return _json(_run_on_runtime(lambda rt: rt.join(meeting_url), timeout=45.0))
+
+
+def zoom_chat_join_calendar_event(args: dict[str, Any], **_: Any) -> str:
+    event_id = str((args or {}).get("event_id") or "").strip()
+    if not event_id:
+        return _json({"ok": False, "error": "event_id is required"})
+    try:
+        calendar_event, meeting_url = resolve_event_for_join(event_id)
+    except Exception as exc:
+        return _json({"ok": False, "error": f"calendar event could not be resolved: {type(exc).__name__}"})
+    result = dict(_run_on_runtime(lambda rt: rt.join(meeting_url), timeout=45.0))
+    # The calendar tool is the secret-safe boundary. Runtime status includes a
+    # query-redacted meeting URL for manual diagnostics, but calendar-driven
+    # jobs must not receive even the Zoom host or meeting path.
+    result.pop("meeting_url", None)
+    result["calendar_event"] = calendar_event
+    return _json(result)
 
 
 def zoom_chat_leave(args: dict[str, Any] | None = None, **_: Any) -> str:
@@ -96,6 +115,27 @@ def register_tools(ctx) -> None:
             },
         },
         handler=zoom_chat_join,
+    )
+    ctx.register_tool(
+        name="zoom_chat_join_calendar_event",
+        toolset=ADMIN_TOOLSET,
+        description="Join the accepted current Zoom event from the primary Google Calendar without exposing its join URL.",
+        schema={
+            "name": "zoom_chat_join_calendar_event",
+            "description": "Refetch an accepted current primary-calendar event by ID, resolve its Zoom URL internally, and join it as Hio. The URL is never returned.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_id": {
+                        "type": "string",
+                        "description": "Google Calendar event ID emitted by the calendar auto-join monitor."
+                    }
+                },
+                "required": ["event_id"],
+                "additionalProperties": False,
+            },
+        },
+        handler=zoom_chat_join_calendar_event,
     )
     ctx.register_tool(
         name="zoom_chat_leave",

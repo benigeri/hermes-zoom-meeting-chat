@@ -1,6 +1,6 @@
 # Hermes Zoom Meeting Chat
 
-Standalone Hermes platform plugin for a narrow v0.4 Zoom meeting-chat and voice-command flow backed by Recall.ai.
+Standalone Hermes platform plugin for a narrow v0.5 Zoom meeting-chat, voice-command, and calendar auto-join flow backed by Recall.ai.
 
 - One active meeting per Hermes profile
 - One visible Zoom participant named `Hio`
@@ -10,7 +10,8 @@ Standalone Hermes platform plugin for a narrow v0.4 Zoom meeting-chat and voice-
 - Voice invocations receive an immediate public acknowledgement, then one complete public answer
 - Finalized speech from all participants is kept in memory as meeting context until leave begins
 - Other participants cannot invoke Hio; ordinary group-chat messages are ignored
-- No retained recording, audio, video, transcript, or media artifacts; no summaries or calendar auto-join
+- No retained recording, audio, video, transcript, or media artifacts; no automatic summaries
+- Optional native-Hermes cron companion auto-joins accepted Zoom events from Paul's primary Google Calendar
 
 The plugin stays inert unless explicitly enabled and configured with Recall credentials plus a public HTTPS callback URL. The public lane relies on Hermes's generic per-source context policy to disable private memory and context files; the voice extension adds no further Hermes-core code.
 
@@ -24,8 +25,9 @@ The plugin stays inert unless explicitly enabled and configured with Recall cred
 - `client.py` — minimal Recall REST client with injectable fake transport.
 - `runtime.py` — profile-scoped one-meeting runtime, pairing, routing, lifecycle, payload construction.
 - `webhook.py` — Recall workspace HMAC verification and bounded callback admission.
-- `tools.py` — `zoom_chat_join`, `zoom_chat_leave`, `zoom_chat_status` management tools.
-- `tests/` — fake Recall/webhook/plugin-discovery tests.
+- `tools.py` — manual join, secret-safe calendar join, leave, and status management tools.
+- `scripts/calendar_auto_join_monitor.py` — deterministic primary-calendar Zoom candidate collector for Hermes cron.
+- `tests/` — fake Recall/webhook/plugin-discovery and calendar-candidate tests.
 
 ## Configuration sketch
 
@@ -88,6 +90,18 @@ RECALL_WEBHOOK_SECRET=whsec_...
 8. Recall streams finalized utterances from all participants. The plugin keeps them in memory during the meeting and supplies the transcript so far to every public typed or spoken invocation.
 9. The public route uses its own Hermes group-chat session and technically suppresses profile memory and context files. Its only permitted ambient model capability is Hermes's `x_search` through the Tool Search bridge; private and platform-management tools remain unavailable. Hio must answer from the operator request, meeting transcript, and any explicit public web lookup.
 10. Use `zoom_chat_leave` to leave. The plugin stops callback admission, removes live routes, and clears its in-memory transcript before it calls Recall's leave endpoint, including when the provider leave later fails.
+
+### Calendar auto-join companion
+
+Calendar auto-join uses Hermes's native scheduler rather than a second bot runtime. Configure a one-minute agent cron with `scripts/calendar_auto_join_monitor.py` as its deterministic `monitor` and expose only the `zoom_meeting_chat_admin` toolset to that job. The collector reads the primary Google Calendar through Hermes-managed OAuth and emits only the event ID plus start/end times; it omits the event title and every Zoom URL. The cron calls `zoom_chat_join_calendar_event(event_id)`, which refetches the event and resolves its secret-bearing Zoom URL inside the admin tool without putting that URL in monitor state or the model prompt. A candidate is emitted only when:
+
+- the event is timed, confirmed, and accepted by the authenticated user (organizer-owned events without a self-attendee row are accepted);
+- a `zoom.us/j/…` URL appears in the location, description, hangout link, or conference entry points; and
+- the meeting is underway or begins within 90 seconds.
+
+For back-to-back calls, the newest eligible start wins so the cron can leave the ending meeting and join the next one. The plugin still enforces one active meeting per profile. A successful auto-join returns the normal one-use pairing phrase; Paul must pair in each meeting before private, public, or voice commands are accepted. Events without Zoom links, declined/cancelled events, and all-day blocks are ignored.
+
+The scheduler job should deliver only successful joins and actionable failures to Paul's trusted control channel. The deterministic monitor emits `candidate: null` while idle; when that baseline first wakes the agent, the agent must return `[SILENT]`. This companion covers the authenticated primary Google Calendar only; it does not imply access to separate Google accounts or non-Zoom conference providers.
 
 While a meeting is active, `zoom_chat_status` reports the 20 most recent finalized transcript segments and whether each matched the paired operator's voice wake phrase. This diagnostic state is in memory only and clears on leave.
 
