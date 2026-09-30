@@ -123,18 +123,19 @@ class RecallWebhookReceiver:
             return WebhookAdmission(400, str(exc))
         async with self.runtime.admission_lock:
             active = self.runtime.active
-            if event_type == CHAT_EVENT:
-                admitted = self.runtime.should_admit_chat_event(candidate)
-            else:
-                admitted = self.runtime.should_admit_transcript_event(candidate)
             if (
                 not self.runtime.accepting_callbacks
                 or self.runtime.shutting_down
                 or active is None
                 or not active.bot_id
                 or candidate.bot_id != active.bot_id
-                or not admitted
             ):
+                return WebhookAdmission(204, "")
+            if event_type == CHAT_EVENT:
+                admitted = self.runtime.should_admit_chat_event(candidate)
+            else:
+                admitted = self.runtime.should_admit_transcript_event(candidate)
+            if not admitted:
                 return WebhookAdmission(204, "")
             if self.dedup.contains(wid):
                 return WebhookAdmission(204, "")

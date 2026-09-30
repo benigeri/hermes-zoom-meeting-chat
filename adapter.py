@@ -85,12 +85,10 @@ class ZoomMeetingChatAdapter(BasePlatformAdapter):
         return {"name": "Zoom Meeting Chat DM", "type": "dm"}
 
     def toolsets_for_source(self, source):
-        return ["no_mcp"]
+        return None
 
     def context_policy_for_source(self, source):
-        """Keep public meeting turns outside private profile context."""
-        if getattr(source, "chat_type", None) == "group":
-            return {"skip_memory": True, "skip_context_files": True}
+        """Authenticated operator turns use normal Hermes profile context."""
         return None
 
 
@@ -113,12 +111,12 @@ def register(ctx) -> None:
         max_message_length=4000,
         platform_hint=(
             "Zoom Meeting Chat has two isolated routes. Direct messages are private. "
-            "A group route is created only when the paired operator starts a public message with "
+            "A group route is created only when the trusted operator starts a public message with "
             "@Hio (or Hio: if Zoom strips the mention marker), or starts a finalized spoken utterance with "
             "Hotel India, Hotel Hotel, or a compatible Hey Hio form; replies on that route are visible to everyone. "
             "The group turn includes the live meeting transcript so far. "
-            "For group replies, use only the operator request and meeting transcript: do not reveal or rely on "
-            "personal memory, private Zoom DM history, credentials, local paths, or private-source facts. "
+            "Only the trusted operator can dispatch a turn. Their requests may use the same private context and "
+            "tools as Slack, but every group reply is visible to everyone in the meeting. "
             "Never fall back between private and public audiences."
         ),
         emoji="🎥",

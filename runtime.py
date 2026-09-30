@@ -16,7 +16,6 @@ from urllib.parse import urlsplit, urlunsplit
 from hermes_constants import get_hermes_home, hermes_home_key
 
 from .client import RecallClient
-from .compat import zero_tool_schema_preflight
 from .config import BOT_NAME, PLATFORM, ZoomChatConfig
 from .redact import redact_meeting_url, redact_text
 
@@ -63,6 +62,7 @@ class RecallChatEvent:
     bot_id: str
     participant_id: str
     participant_name: str
+    zoom_conf_user_id: str | None
     text: str
     recipient: str
     message_id: str
@@ -73,6 +73,7 @@ class RecallTranscriptEvent:
     bot_id: str
     participant_id: str
     participant_name: str
+    zoom_conf_user_id: str | None
     text: str
     start_relative: float
     message_id: str
@@ -94,15 +95,16 @@ _PUBLIC_MENTION_RE = re.compile(
     r"^\s*(?:@hio\s*:?[ \t]+|hio\s*:[ \t]+)(?P<request>\S(?:.*\S)?)\s*$",
     re.IGNORECASE,
 )
+_VOICE_LEADING_FILLER = r"(?:(?:ok(?:ay)?|all\s+right|alright|hey)\s*[,.:;-]?\s+)?"
 _VOICE_WAKE_RE = re.compile(
-    r"^\s*(?:"
+    rf"^\s*{_VOICE_LEADING_FILLER}(?:"
     r"(?:hey|hello|hi)\s*,?\s+h[\s.-]*i[\s.-]*o"
     r"|hotel\s+(?:india|hotel)"
     r")\s*[:,]?\s+(?P<request>\S(?:.*\S)?)\s*$",
     re.IGNORECASE,
 )
 _VOICE_WAKE_ONLY_RE = re.compile(
-    r"^\s*(?:"
+    rf"^\s*{_VOICE_LEADING_FILLER}(?:"
     r"(?:hey|hello|hi)\s*,?\s+h[\s.-]*i[\s.-]*o"
     r"|hotel\s+(?:india|hotel)"
     r"|hotel"
@@ -110,6 +112,31 @@ _VOICE_WAKE_ONLY_RE = re.compile(
     re.IGNORECASE,
 )
 _VOICE_WAKE_FOLLOW_UP_SECONDS = 3.0
+_MAX_VOICE_DIAGNOSTICS = 50
+
+
+def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write JSON without a world-readable temp-file window."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    )
+    fd: int | None = None
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = None
+            json.dump(payload, fh, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp, path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def extract_public_request(text: str) -> str | None:
@@ -140,6 +167,25 @@ def is_voice_wake_only(text: str) -> bool:
     return _VOICE_WAKE_ONLY_RE.match(text or "") is not None
 
 
+def _zoom_conf_user_id(participant: dict[str, Any]) -> str | None:
+    """Read Recall's stable Zoom account identifier without trusting names."""
+    extra_data = participant.get("extra_data")
+    if not isinstance(extra_data, dict):
+        return None
+    zoom = extra_data.get("zoom")
+    if not isinstance(zoom, dict):
+        return None
+    value = zoom.get("conf_user_id")
+    if not isinstance(value, (str, int)):
+        return None
+    normalized = str(value).strip()
+    return normalized if normalized and len(normalized) <= 512 else None
+
+
+def _zoom_identity_digest(conf_user_id: str) -> str:
+    return hashlib.sha256(conf_user_id.encode("utf-8")).hexdigest()
+
+
 def parse_recall_chat_event(event: dict[str, Any]) -> RecallChatEvent:
     """Parse Recall's documented real-time chat envelope, failing closed."""
     envelope_value = event.get("data")
@@ -156,6 +202,7 @@ def parse_recall_chat_event(event: dict[str, Any]) -> RecallChatEvent:
     bot_id = str(bot_value.get("id") or "").strip()
     participant_id = str(participant_value.get("id") or "").strip()
     participant_name = str(participant_value.get("name") or "")
+    zoom_conf_user_id = _zoom_conf_user_id(participant_value)
     text = str(message_value.get("text") or "")
     recipient = str(message_value.get("to") or "").strip().lower()
     message_id = str(event.get("webhook_id") or "").strip()
@@ -165,6 +212,7 @@ def parse_recall_chat_event(event: dict[str, Any]) -> RecallChatEvent:
         bot_id=bot_id,
         participant_id=participant_id,
         participant_name=participant_name,
+        zoom_conf_user_id=zoom_conf_user_id,
         text=text,
         recipient=recipient,
         message_id=message_id,
@@ -187,6 +235,7 @@ def parse_recall_transcript_event(event: dict[str, Any]) -> RecallTranscriptEven
     bot_id = str(bot_value.get("id") or "").strip()
     participant_id = str(participant_value.get("id") or "").strip()
     participant_name = str(participant_value.get("name") or "").strip() or "Unknown participant"
+    zoom_conf_user_id = _zoom_conf_user_id(participant_value)
     message_id = str(event.get("webhook_id") or "").strip()
     parts: list[str] = []
     start_relative: float | None = None
@@ -212,6 +261,7 @@ def parse_recall_transcript_event(event: dict[str, Any]) -> RecallTranscriptEven
         bot_id=bot_id,
         participant_id=participant_id,
         participant_name=participant_name,
+        zoom_conf_user_id=zoom_conf_user_id,
         text=text,
         start_relative=max(0.0, start_relative or 0.0),
         message_id=message_id,
@@ -325,6 +375,8 @@ class ZoomChatRuntime:
         loop: asyncio.AbstractEventLoop | None = None,
         dispatch: Callable[[Any], Any] | None = None,
         state_path: Path | None = None,
+        identity_path: Path | None = None,
+        diagnostic_path: Path | None = None,
     ) -> None:
         self.config = config
         self.client = client
@@ -342,7 +394,152 @@ class ZoomChatRuntime:
         self.accepting_callbacks = True
         self.shutting_down = False
         self.state_path = state_path or (get_hermes_home() / "state" / "zoom_meeting_chat.json")
+        self.identity_path = identity_path or self.state_path.with_name(
+            "zoom_meeting_chat_trusted_operator.json"
+        )
+        self.diagnostic_path = diagnostic_path or self.state_path.with_name(
+            "zoom_meeting_chat_voice_diagnostics.json"
+        )
+        self._trusted_zoom_conf_user_id_sha256: str | None = None
+        self._voice_diagnostics: list[dict[str, Any]] = []
+        self._load_trusted_operator()
+        self._load_voice_diagnostics()
         self._load_tombstone()
+
+    def _load_trusted_operator(self) -> None:
+        """Load the hash-only durable Zoom identity, failing closed on corruption."""
+        if not self.identity_path.exists():
+            return
+        try:
+            raw = json.loads(self.identity_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("invalid trusted operator state")
+            digest = str(raw.get("zoom_conf_user_id_sha256") or "").strip().lower()
+            if raw.get("version") != 1 or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError("unsupported trusted operator state")
+            self._trusted_zoom_conf_user_id_sha256 = digest
+        except Exception:
+            logger.warning("Ignoring unreadable Zoom trusted-operator state", exc_info=True)
+
+    def _persist_trusted_operator(self, conf_user_id: str) -> None:
+        digest = _zoom_identity_digest(conf_user_id)
+        _atomic_write_private_json(
+            self.identity_path,
+            {"version": 1, "zoom_conf_user_id_sha256": digest},
+        )
+        self._trusted_zoom_conf_user_id_sha256 = digest
+
+    def _load_voice_diagnostics(self) -> None:
+        if not self.diagnostic_path.exists():
+            return
+        try:
+            raw = json.loads(self.diagnostic_path.read_text(encoding="utf-8"))
+            entries = raw.get("entries") if isinstance(raw, dict) else None
+            if not isinstance(raw, dict) or raw.get("version") != 1 or not isinstance(entries, list):
+                raise ValueError("unsupported voice diagnostic state")
+            validated: list[dict[str, Any]] = []
+            for entry in entries[-_MAX_VOICE_DIAGNOSTICS:]:
+                if not isinstance(entry, dict):
+                    raise ValueError("invalid voice diagnostic entry")
+                text = entry.get("text")
+                outcome = entry.get("outcome")
+                start_relative = entry.get("start_relative")
+                voice_wake_match = entry.get("voice_wake_match")
+                if (
+                    not isinstance(text, str)
+                    or len(text) > 4000
+                    or outcome not in {"ignored", "armed", "command", "follow_up"}
+                    or not isinstance(start_relative, (int, float))
+                    or not isinstance(voice_wake_match, bool)
+                ):
+                    raise ValueError("invalid voice diagnostic entry")
+                validated.append(
+                    {
+                        "text": text,
+                        "start_relative": float(start_relative),
+                        "outcome": outcome,
+                        "voice_wake_match": voice_wake_match,
+                    }
+                )
+            self._voice_diagnostics = validated
+        except Exception:
+            logger.warning("Ignoring unreadable Zoom voice diagnostics", exc_info=True)
+
+    def _persist_voice_diagnostics(self) -> None:
+        _atomic_write_private_json(
+            self.diagnostic_path,
+            {"version": 1, "entries": self._voice_diagnostics},
+        )
+
+    def _clear_voice_diagnostics(self) -> None:
+        _atomic_write_private_json(
+            self.diagnostic_path,
+            {"version": 1, "entries": []},
+        )
+        self._voice_diagnostics = []
+
+    def _record_voice_diagnostic(
+        self, candidate: RecallTranscriptEvent, outcome: str
+    ) -> None:
+        entry = {
+            "text": candidate.text,
+            "start_relative": candidate.start_relative,
+            "outcome": outcome,
+            "voice_wake_match": outcome in {"armed", "command", "follow_up"},
+        }
+        self._voice_diagnostics = (
+            self._voice_diagnostics + [entry]
+        )[-_MAX_VOICE_DIAGNOSTICS:]
+        try:
+            self._persist_voice_diagnostics()
+        except Exception:
+            logger.warning("Could not persist Zoom voice diagnostics", exc_info=True)
+
+    def _trusted_operator_matches(self, conf_user_id: str | None) -> bool:
+        return bool(
+            conf_user_id
+            and self._trusted_zoom_conf_user_id_sha256
+            and secrets.compare_digest(
+                _zoom_identity_digest(conf_user_id),
+                self._trusted_zoom_conf_user_id_sha256,
+            )
+        )
+
+    def _bind_operator(self, participant_id: str, participant_name: str) -> None:
+        m = self.active
+        if not m or not m.bot_id:
+            return
+        m.operator_participant_id = participant_id
+        m.operator_name = participant_name
+        chat_id = self._chat_id(m.bot_id, participant_id)
+        self.chat_routes[chat_id] = (m.bot_id, participant_id, m.generation, "dm")
+
+    def _maybe_bind_trusted_operator(
+        self,
+        participant_id: str,
+        participant_name: str,
+        conf_user_id: str | None,
+    ) -> bool:
+        m = self.active
+        if not m or participant_id == m.bot_participant_id:
+            return False
+        if (
+            conf_user_id
+            and not self._trusted_zoom_conf_user_id_sha256
+            and m.paired
+            and participant_id == m.operator_participant_id
+        ):
+            try:
+                self._persist_trusted_operator(conf_user_id)
+            except Exception:
+                logger.warning(
+                    "Could not persist the paired Zoom operator identity",
+                    exc_info=True,
+                )
+        if not self._trusted_operator_matches(conf_user_id):
+            return False
+        self._bind_operator(participant_id, participant_name)
+        return True
 
     def _load_tombstone(self) -> None:
         """Restore an unresolved bot as uncertain so restarts cannot double-join."""
@@ -395,20 +592,7 @@ class ZoomChatRuntime:
             "bot_id": m.bot_id,
             "created_at": m.created_at,
         }
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.state_path.with_name(f".{self.state_path.name}.{os.getpid()}.tmp")
-        try:
-            with temp.open("w", encoding="utf-8") as fh:
-                json.dump(payload, fh, sort_keys=True)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.chmod(temp, 0o600)
-            os.replace(temp, self.state_path)
-        finally:
-            try:
-                temp.unlink()
-            except FileNotFoundError:
-                pass
+        _atomic_write_private_json(self.state_path, payload)
 
     def _clear_tombstone(self) -> None:
         try:
@@ -419,7 +603,17 @@ class ZoomChatRuntime:
     def _status_dict(self, *, include_phrase: bool = False) -> dict[str, Any]:
         m = self.active
         if not m:
-            return {"ok": True, "active": False, "platform": PLATFORM}
+            out = {
+                "ok": True,
+                "active": False,
+                "platform": PLATFORM,
+                "trusted_operator_configured": bool(
+                    self._trusted_zoom_conf_user_id_sha256
+                ),
+            }
+            if self._voice_diagnostics:
+                out["recent_voice_diagnostics"] = list(self._voice_diagnostics)
+            return out
         out = {
             "ok": True,
             "active": True,
@@ -433,6 +627,9 @@ class ZoomChatRuntime:
             "generation": m.generation,
             "pairing_expires_at": m.pairing_expires_at,
             "transcript_segment_count": len(m.transcript_segments),
+            "trusted_operator_configured": bool(
+                self._trusted_zoom_conf_user_id_sha256
+            ),
         }
         if m.transcript_segments:
             def diagnostic(segment: TranscriptSegment) -> dict[str, Any]:
@@ -453,6 +650,8 @@ class ZoomChatRuntime:
                 diagnostic(segment) for segment in m.transcript_segments[-20:]
             ]
             out["latest_transcript"] = out["recent_transcripts"][-1]
+        if self._voice_diagnostics:
+            out["recent_voice_diagnostics"] = list(self._voice_diagnostics)
         if include_phrase and not m.phrase_revealed:
             out["pairing_phrase"] = m.pairing_phrase
         return out
@@ -498,9 +697,6 @@ class ZoomChatRuntime:
             return {"ok": True, "handled": True, "terminal": True}
 
     async def join(self, meeting_url: str) -> dict[str, Any]:
-        compat = zero_tool_schema_preflight()
-        if not compat.ok:
-            return {"ok": False, "error": compat.message, "create_bot_called": False}
         clean_url, fp = normalize_meeting_url(meeting_url)
         async with self.join_lock:
             if self.shutting_down:
@@ -550,10 +746,34 @@ class ZoomChatRuntime:
                         "error": "Recall bot was created but durable state could not be updated; meeting state is uncertain",
                         "uncertain": True,
                     }
+                try:
+                    self._clear_voice_diagnostics()
+                except Exception as exc:
+                    logger.warning("Could not clear prior Zoom voice diagnostics", exc_info=True)
+                    out = self._status_dict(include_phrase=True)
+                    self.active.phrase_revealed = True
+                    out.update(
+                        {
+                            "ok": False,
+                            "active": True,
+                            "error": (
+                                "Recall bot was created, but prior Zoom voice diagnostics "
+                                f"could not be cleared: {type(exc).__name__}"
+                            ),
+                        }
+                    )
+                    return out
                 out = self._status_dict(include_phrase=True)
                 self.active.phrase_revealed = True
                 out["ok"] = True
-                out["pairing_instructions"] = "Send pairing_phrase as a direct Zoom message to Hio within 10 minutes. It is shown only in this tool result."
+                if self._trusted_zoom_conf_user_id_sha256:
+                    out["pairing_instructions"] = (
+                        "The trusted Zoom account will be authorized automatically. "
+                        "If Zoom omits its stable account ID, send pairing_phrase as "
+                        "a direct Zoom message to Hio within 10 minutes."
+                    )
+                else:
+                    out["pairing_instructions"] = "Send pairing_phrase as a direct Zoom message to Hio within 10 minutes. It is shown only in this tool result."
                 return out
             except Exception as exc:
                 if self.active:
@@ -669,16 +889,29 @@ class ZoomChatRuntime:
         return await self.client.send_chat_message(bot_id, recipient, text)
 
     def should_admit_chat_event(self, candidate: RecallChatEvent) -> bool:
-        """Cheap admission gate used before a signed callback enters the queue."""
+        """Pure admission gate used before a signed callback enters the queue."""
         m = self.active
-        if not m or not m.bot_id or candidate.bot_id != m.bot_id:
+        if (
+            not m
+            or not m.bot_id
+            or candidate.bot_id != m.bot_id
+            or candidate.participant_id == m.bot_participant_id
+        ):
             return False
+        current_operator = bool(
+            m.paired and candidate.participant_id == m.operator_participant_id
+        )
+        trusted_operator = self._trusted_operator_matches(candidate.zoom_conf_user_id)
+        fallback_pairing = bool(
+            not m.paired
+            and time.time() <= m.pairing_expires_at
+            and (candidate.text or "").strip() == m.pairing_phrase
+        )
         if candidate.recipient == "only_bot":
-            return True
+            return current_operator or trusted_operator or fallback_pairing
         return bool(
             candidate.recipient == "everyone"
-            and m.paired
-            and candidate.participant_id == m.operator_participant_id
+            and (current_operator or trusted_operator)
             and extract_public_request(candidate.text)
         )
 
@@ -702,26 +935,43 @@ class ZoomChatRuntime:
             f"{transcript}\n\nOperator request: {request}"
         )
 
-    def build_operator_event(self, *, text: str, participant_id: str, participant_name: str, message_id: str) -> Any | None:
+    def build_operator_event(
+        self,
+        *,
+        text: str,
+        participant_id: str,
+        participant_name: str,
+        message_id: str,
+        zoom_conf_user_id: str | None = None,
+    ) -> Any | None:
         m = self.active
         if not m or not m.bot_id or participant_id == m.bot_participant_id:
+            return None
+        if (
+            m.paired
+            and time.time() <= m.pairing_expires_at
+            and (text or "").strip() == m.pairing_phrase
+        ):
+            m.pairing_phrase = "<consumed>"
             return None
         if not m.paired:
             if time.time() > m.pairing_expires_at:
                 return None
             if (text or "").strip() != m.pairing_phrase:
                 return None
-            m.operator_participant_id = participant_id
-            m.operator_name = participant_name
+            if zoom_conf_user_id and not self._trusted_zoom_conf_user_id_sha256:
+                try:
+                    self._persist_trusted_operator(zoom_conf_user_id)
+                except Exception:
+                    logger.warning(
+                        "Zoom pairing succeeded but trusted identity persistence failed",
+                        exc_info=True,
+                    )
+            self._bind_operator(participant_id, participant_name)
             m.pairing_phrase = "<consumed>"
-            chat_id = self._chat_id(m.bot_id, participant_id)
-            self.chat_routes[chat_id] = (m.bot_id, participant_id, m.generation, "dm")
             return None
         if participant_id != m.operator_participant_id:
             return None
-        compat = zero_tool_schema_preflight()
-        if not compat.ok:
-            raise RuntimeError(compat.message)
         from gateway.platforms.event import MessageEvent, MessageType
         source = self.adapter.build_source(
             chat_id=self._chat_id(m.bot_id, participant_id),
@@ -742,7 +992,7 @@ class ZoomChatRuntime:
             message_id=message_id,
             internal=False,
             metadata={"zoom_meeting_chat": True, "bot_id": m.bot_id, "generation": m.generation},
-            allow_gateway_control=False,
+            allow_gateway_control=True,
         )
 
     def build_public_operator_event(
@@ -766,9 +1016,6 @@ class ZoomChatRuntime:
             or request is None
         ):
             return None
-        compat = zero_tool_schema_preflight()
-        if not compat.ok:
-            raise RuntimeError(compat.message)
         from gateway.platforms.event import MessageEvent, MessageType
         chat_id = self._group_chat_id(m.bot_id)
         self.chat_routes[chat_id] = (m.bot_id, "everyone", m.generation, "group")
@@ -798,7 +1045,7 @@ class ZoomChatRuntime:
                 "public_mention": not voice_wake,
                 "voice_wake": voice_wake,
             },
-            allow_gateway_control=False,
+            allow_gateway_control=True,
         )
 
     async def process_callback_event(self, event: dict[str, Any]) -> Any | None:
@@ -813,12 +1060,18 @@ class ZoomChatRuntime:
                 return None
             if candidate.bot_id != m.bot_id:
                 return None
+            self._maybe_bind_trusted_operator(
+                candidate.participant_id,
+                candidate.participant_name,
+                candidate.zoom_conf_user_id,
+            )
             if candidate.recipient == "only_bot":
                 return self.build_operator_event(
                     text=candidate.text,
                     participant_id=candidate.participant_id,
                     participant_name=candidate.participant_name,
                     message_id=candidate.message_id,
+                    zoom_conf_user_id=candidate.zoom_conf_user_id,
                 )
             if candidate.recipient == "everyone":
                 return self.build_public_operator_event(
@@ -835,6 +1088,11 @@ class ZoomChatRuntime:
                 return None
             if candidate.bot_id != m.bot_id:
                 return None
+            self._maybe_bind_trusted_operator(
+                candidate.participant_id,
+                candidate.participant_name,
+                candidate.zoom_conf_user_id,
+            )
             m.transcript_segments.append(
                 TranscriptSegment(
                     participant_id=candidate.participant_id,
@@ -849,9 +1107,11 @@ class ZoomChatRuntime:
             if request is not None:
                 m.pending_voice_wake_participant_id = None
                 m.pending_voice_wake_start_relative = None
+                self._record_voice_diagnostic(candidate, "command")
             elif is_voice_wake_only(candidate.text):
                 m.pending_voice_wake_participant_id = candidate.participant_id
                 m.pending_voice_wake_start_relative = candidate.start_relative
+                self._record_voice_diagnostic(candidate, "armed")
                 return None
             else:
                 pending_start = m.pending_voice_wake_start_relative
@@ -865,10 +1125,13 @@ class ZoomChatRuntime:
                 m.pending_voice_wake_participant_id = None
                 m.pending_voice_wake_start_relative = None
                 if not pending_matches:
+                    self._record_voice_diagnostic(candidate, "ignored")
                     return None
                 request = candidate.text.strip()
                 if not request:
+                    self._record_voice_diagnostic(candidate, "ignored")
                     return None
+                self._record_voice_diagnostic(candidate, "follow_up")
             try:
                 await self.client.send_chat_message(m.bot_id, "everyone", "Heard — working on it.")
             except Exception:

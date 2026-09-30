@@ -88,6 +88,42 @@ async def test_signed_irrelevant_or_malformed_events_never_consume_queue_or_dedu
 
 
 @pytest.mark.asyncio
+async def test_stopped_callback_admission_short_circuits_before_runtime_authorization():
+    load_plugin_pkg("zoom_webhook_stopped_pkg")
+    wh = __import__("zoom_webhook_stopped_pkg.webhook", fromlist=["RecallWebhookReceiver"])
+    authorization_calls = []
+
+    def should_admit(candidate):
+        authorization_calls.append(candidate)
+        return True
+
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(webhook_secret="whsec_dGVzdA", webhook_replay_window_seconds=300),
+        queue=asyncio.Queue(maxsize=2),
+        admission_lock=asyncio.Lock(),
+        active=SimpleNamespace(bot_id="bot-1"),
+        accepting_callbacks=False,
+        shutting_down=False,
+        should_admit_chat_event=should_admit,
+    )
+    receiver = wh.RecallWebhookReceiver(runtime)
+    now = int(time.time())
+    body = json.dumps({"event": "participant_events.chat_message", "data": {"data": {"participant": {"id": "paul", "name": "Paul", "extra_data": {"zoom": {"conf_user_id": "trusted"}}}, "timestamp": {"relative": 1.0}, "data": {"text": "hello", "to": "only_bot"}}, "bot": {"id": "bot-1"}}}).encode()
+
+    result = await receiver.admit(
+        method="POST",
+        content_type="application/json",
+        headers=signed(runtime.config.webhook_secret, "stopped", now, body),
+        raw_body=body,
+    )
+
+    assert result.status == 204
+    assert authorization_calls == []
+    assert runtime.queue.qsize() == 0
+    assert not receiver.dedup.contains("stopped")
+
+
+@pytest.mark.asyncio
 async def test_signed_public_mention_is_admitted_only_when_runtime_authorizes_it():
     load_plugin_pkg("zoom_webhook_public_pkg")
     wh = __import__("zoom_webhook_public_pkg.webhook", fromlist=["RecallWebhookReceiver"])
@@ -265,37 +301,3 @@ async def test_status_webhook_rejects_malformed_payload_and_retries_cleanup_fail
     )
     assert failed.status == 503
     assert not receiver.dedup.contains("status-retry")
-
-
-def test_compatibility_preflight_success_and_failures(monkeypatch):
-    load_plugin_pkg("zoom_compat_pkg")
-    compat = __import__("zoom_compat_pkg.compat", fromlist=["zero_tool_schema_preflight"])
-    monkeypatch.setattr("hermes_cli.tools_config._get_plugin_toolset_keys", lambda: {"zoom_meeting_chat_admin"})
-    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda cfg, platform: set() if cfg["platform_toolsets"][platform] == ["no_mcp"] else {"bad"})
-    monkeypatch.setattr(
-        "model_tools.get_tool_definitions",
-        lambda enabled_toolsets=None, quiet_mode=True, skip_tool_search_assembly=False: [],
-    )
-    ok = compat.zero_tool_schema_preflight({"known_plugin_toolsets": {"zoom_meeting_chat": ["zoom_meeting_chat_admin"]}})
-    assert ok.ok is True
-    missing = compat.zero_tool_schema_preflight({"known_plugin_toolsets": {"zoom_meeting_chat": []}})
-    assert missing.ok is False and "known_plugin_toolsets" in missing.message
-    nondefault_context = compat.zero_tool_schema_preflight({"context": {"engine": "lcm"}, "known_plugin_toolsets": {"zoom_meeting_chat": ["zoom_meeting_chat_admin"]}})
-    assert nondefault_context.ok is False and "context.engine" in nondefault_context.message
-    def bridge_only(enabled_toolsets=None, quiet_mode=True, skip_tool_search_assembly=False):
-        names = ["x_search"] if skip_tool_search_assembly else ["tool_search", "tool_describe", "tool_call"]
-        return [{"function": {"name": name}} for name in names]
-
-    monkeypatch.setattr("model_tools.get_tool_definitions", bridge_only)
-    bridge = compat.zero_tool_schema_preflight(
-        {"known_plugin_toolsets": {"zoom_meeting_chat": ["zoom_meeting_chat_admin"]}}
-    )
-    assert bridge.ok is True
-
-    def leaked_tool(enabled_toolsets=None, quiet_mode=True, skip_tool_search_assembly=False):
-        names = ["terminal"] if skip_tool_search_assembly else ["terminal"]
-        return [{"function": {"name": name}} for name in names]
-
-    monkeypatch.setattr("model_tools.get_tool_definitions", leaked_tool)
-    leak = compat.zero_tool_schema_preflight({"known_plugin_toolsets": {"zoom_meeting_chat": ["zoom_meeting_chat_admin"]}})
-    assert leak.ok is False and "unsupported model tool schemas" in leak.message

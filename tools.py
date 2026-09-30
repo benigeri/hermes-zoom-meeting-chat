@@ -106,7 +106,7 @@ def register_tools(ctx) -> None:
         description="Start Hio as a DM-only Zoom meeting chat participant through Recall.ai.",
         schema={
             "name": "zoom_chat_join",
-            "description": "Join one Zoom meeting as Hio and return a one-use DM pairing phrase. Fails closed unless the gateway adapter is connected and zero model tools are configured.",
+            "description": "Join one Zoom meeting as Hio and return a one-use DM pairing phrase. After first pairing, Paul's stable Zoom account is authorized automatically when Recall supplies its matching account ID.",
             "parameters": {
                 "type": "object",
                 "properties": {"meeting_url": {"type": "string", "description": "HTTPS zoom.us meeting URL"}},
