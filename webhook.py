@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from gateway.platforms.helpers import MessageDeduplicator
 
+from .config import decode_webhook_secret
 from .runtime import (
     parse_recall_bot_status_event,
     parse_recall_chat_event,
@@ -30,13 +31,7 @@ class WebhookAdmission:
 
 
 def _secret_bytes(secret: str) -> bytes:
-    if not secret.startswith("whsec_"):
-        raise ValueError("Recall webhook secret must begin with whsec_")
-    raw = secret[len("whsec_"):]
-    try:
-        return base64.b64decode(raw + "=" * (-len(raw) % 4), validate=True)
-    except Exception as exc:
-        raise ValueError("Recall webhook secret has invalid base64") from exc
+    return decode_webhook_secret(secret)
 
 
 def _candidate_sigs(header: str) -> list[str]:

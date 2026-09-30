@@ -20,6 +20,17 @@ def signed(secret: str, wid: str, ts: int, body: bytes):
     return {"webhook-id": wid, "webhook-timestamp": str(ts), "webhook-signature": "v1," + base64.b64encode(digest).decode()}
 
 
+@pytest.mark.parametrize("secret", ["whsec_", "whsec_%%%"])
+def test_empty_or_malformed_webhook_secret_is_rejected(secret):
+    load_plugin_pkg("zoom_webhook_invalid_secret_pkg")
+    wh = __import__(
+        "zoom_webhook_invalid_secret_pkg.webhook", fromlist=["_secret_bytes"]
+    )
+
+    with pytest.raises(ValueError):
+        wh._secret_bytes(secret)
+
+
 @pytest.mark.asyncio
 async def test_hmac_admission_dedup_and_queue_full():
     load_plugin_pkg("zoom_webhook_pkg")

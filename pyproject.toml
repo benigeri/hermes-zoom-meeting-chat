@@ -1,6 +1,6 @@
 [project]
 name = "hermes-zoom-meeting-chat"
-version = "0.5.3"
+version = "0.5.4"
 description = "Calendar-aware paired DM, public mention, and voice-command Recall.ai Zoom platform plugin for Hermes"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -17,9 +18,22 @@ ALLOWED_RECALL_BASE_URLS = {
 
 
 def _secret(name: str, default: str = "") -> str:
-    from agent.secret_scope import get_secret
+    from gateway.platforms._shared import get_scoped_secret
 
-    return (get_secret(name, default) or default).strip()
+    return (get_scoped_secret(name, default, external_fallback=True) or default).strip()
+
+
+def decode_webhook_secret(secret: str) -> bytes:
+    if not secret.startswith("whsec_"):
+        raise ValueError("RECALL_WEBHOOK_SECRET must begin with whsec_")
+    raw = secret[len("whsec_"):]
+    try:
+        decoded = base64.b64decode(raw + "=" * (-len(raw) % 4), validate=True)
+    except Exception as exc:
+        raise ValueError("RECALL_WEBHOOK_SECRET has invalid base64") from exc
+    if not decoded:
+        raise ValueError("RECALL_WEBHOOK_SECRET must contain a non-empty signing key")
+    return decoded
 
 
 def _extra(extra: Mapping[str, Any] | None, key: str, default: Any = None) -> Any:
@@ -80,8 +94,7 @@ class ZoomChatConfig:
     def validate_ready(self) -> None:
         if not self.api_key:
             raise ValueError("RECALL_API_KEY is required")
-        if not self.webhook_secret.startswith("whsec_"):
-            raise ValueError("RECALL_WEBHOOK_SECRET must be set and begin with whsec_")
+        decode_webhook_secret(self.webhook_secret)
         if not self.callback_public_base_url:
             raise ValueError("callback_public_base_url is required")
         if urlsplit(self.callback_public_base_url).scheme != "https":
@@ -90,7 +103,10 @@ class ZoomChatConfig:
 
 def requirements_available() -> bool:
     try:
-        return bool(_secret("RECALL_API_KEY") and _secret("RECALL_WEBHOOK_SECRET").startswith("whsec_"))
+        if not _secret("RECALL_API_KEY"):
+            return False
+        decode_webhook_secret(_secret("RECALL_WEBHOOK_SECRET"))
+        return True
     except Exception:
         return False
 
