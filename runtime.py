@@ -1065,6 +1065,31 @@ class ZoomChatRuntime:
                 candidate.participant_name,
                 candidate.zoom_conf_user_id,
             )
+            public_request = extract_public_request(candidate.text)
+            if public_request is not None and candidate.recipient in {
+                "only_bot",
+                "everyone",
+            }:
+                public_event = self.build_public_operator_event(
+                    text=candidate.text,
+                    participant_id=candidate.participant_id,
+                    participant_name=candidate.participant_name,
+                    message_id=candidate.message_id,
+                    request=public_request,
+                )
+                if public_event is None:
+                    return None
+                try:
+                    await self.client.send_chat_message(
+                        m.bot_id,
+                        "everyone",
+                        "Heard — working on it.",
+                    )
+                except Exception:
+                    # Match the voice path: acknowledgement is best-effort and
+                    # must never suppress the requested Hermes turn.
+                    logger.warning("Zoom typed acknowledgement failed", exc_info=True)
+                return public_event
             if candidate.recipient == "only_bot":
                 return self.build_operator_event(
                     text=candidate.text,
@@ -1072,13 +1097,6 @@ class ZoomChatRuntime:
                     participant_name=candidate.participant_name,
                     message_id=candidate.message_id,
                     zoom_conf_user_id=candidate.zoom_conf_user_id,
-                )
-            if candidate.recipient == "everyone":
-                return self.build_public_operator_event(
-                    text=candidate.text,
-                    participant_id=candidate.participant_id,
-                    participant_name=candidate.participant_name,
-                    message_id=candidate.message_id,
                 )
             return None
         if event_type == "transcript.data":

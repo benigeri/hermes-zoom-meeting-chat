@@ -336,6 +336,35 @@ async def test_paired_operator_native_public_mention_dispatches_to_isolated_grou
     assert adapter.sources[-1]["chat_id"] == "meeting:bot-1:group"
     assert event.metadata["zoom_audience"] == "everyone"
     assert event.metadata["public_mention"] is True
+    assert _transport.requests[-1][2] == {
+        "to": "everyone",
+        "message": "Heard — working on it.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_zoom_native_mention_marked_only_bot_routes_publicly_with_ack(runtime):
+    rt, transport, adapter = runtime
+    joined = await rt.join("https://example.zoom.us/j/123")
+
+    def incoming(sender, text, *, to="only_bot", wid="evt"):
+        return {"webhook_id": wid, "event": "participant_events.chat_message", "data": {"data": {"participant": {"id": sender, "name": "Paul"}, "timestamp": {"absolute": "2026-09-28T00:00:00Z", "relative": 1.0}, "data": {"text": text, "to": to}}, "bot": {"id": "bot-1"}}}
+
+    await rt.process_callback_event(incoming("paul", joined["pairing_phrase"], wid="pair"))
+    event = await rt.process_callback_event(
+        incoming("paul", "@Hio research this", wid="native-mention")
+    )
+
+    assert event is not None
+    assert event.text == "research this"
+    assert event.source.chat_type == "group"
+    assert adapter.sources[-1]["chat_id"] == "meeting:bot-1:group"
+    assert event.metadata["zoom_audience"] == "everyone"
+    assert event.metadata["public_mention"] is True
+    assert transport.requests[-1][2] == {
+        "to": "everyone",
+        "message": "Heard — working on it.",
+    }
 
 
 @pytest.mark.asyncio

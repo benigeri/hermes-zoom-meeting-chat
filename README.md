@@ -1,11 +1,11 @@
 # Hermes Zoom Meeting Chat
 
-Standalone Hermes platform plugin for a narrow v0.6.0 Zoom meeting-chat, voice-command, and calendar auto-join flow backed by Recall.ai.
+Standalone Hermes platform plugin for a narrow v0.6.1 Zoom meeting-chat, voice-command, and calendar auto-join flow backed by Recall.ai.
 
 - One active meeting per Hermes profile
 - One visible Zoom participant named `Hio`
 - One trusted operator, learned from a one-use pairing phrase and then matched by a hash of Zoom's stable `conf_user_id`
-- Private Zoom DMs plus a public group route invoked by the trusted operator with native `@Hio`
+- Private Zoom DMs plus a public group route invoked by the trusted operator with native `@Hio`, including Recall callbacks that encode the native mention as `only_bot`
 - Finalized `Hotel India …`, `Hotel Hotel …`, or compatible `Hey Hio …` speech from the trusted operator invokes the same public route; bounded fillers such as `Okay` and `All right` are accepted only before the wake phrase
 - If Recall splits the wake phrase from its command, the trusted speaker's next finalized segment is accepted for three seconds; a standalone `hotel` only arms this bounded fallback
 - Voice invocations receive an immediate public acknowledgement, then one complete public answer
@@ -108,7 +108,7 @@ In Recall's regional Webhooks dashboard, create one endpoint at
 3. On first use, send that phrase as a direct Zoom message to `Hio` within 10 minutes. The plugin stores only a SHA-256 hash of the paired account's stable Zoom `conf_user_id`, in a mode-`0600` profile state file.
 4. On later calls, matching `conf_user_id` events auto-authorize Paul's current meeting participant ID. If Zoom omits the stable ID because Paul joined as a guest or logged out, the plugin fails closed and requires the one-use phrase for that meeting.
 5. Private messages use the exact live DM route `meeting:{bot_id}:dm:{participant_id}` and reply only to that participant.
-6. To invoke Hio publicly, begin a message in Zoom's group chat with `@Hio`, such as `@Hio summarize the decision`. If Zoom/Recall strips the `@`, `Hio:` is accepted as a compatibility fallback. Hio replies to `everyone`.
+6. To invoke Hio publicly, begin a message in Zoom's group chat with `@Hio`, such as `@Hio summarize the decision`. Recall may encode that native mention as an `only_bot` callback; the plugin detects the anchored mention and normalizes it onto the public group route. If Zoom/Recall strips the `@`, `Hio:` is accepted as a compatibility fallback. Hio first posts `Heard — working on it.`, then replies to `everyone`.
 7. To invoke Hio by voice, begin a finalized utterance with `Hotel India` or `Hotel Hotel`, such as `Hotel India, what did we decide?`. Compatible `Hey Hio` forms remain aliases. Bounded leading fillers such as `Okay` and `All right` are accepted, but incidental mid-sentence mentions are not. Only the trusted operator's current participant ID can trigger this route. Hio first posts `Heard — working on it.`, then posts one complete answer to `everyone` in Zoom chat.
 8. Recall streams finalized utterances from all participants. The plugin keeps them in memory during the meeting and supplies the transcript so far to every public typed or spoken invocation.
 9. Authenticated Zoom operator turns use the same profile context, toolsets, and Hermes approval/control path as Slack. The public route uses its own Hermes group-chat session, but its answers are visible to everyone in the meeting. Normal tool-level approval gates still apply.
@@ -124,7 +124,7 @@ Calendar auto-join uses Hermes's native scheduler rather than a second bot runti
 
 For back-to-back calls, the newest eligible start wins so the cron can leave the ending meeting and join the next one. The plugin still enforces one active meeting per profile. After the first manual pairing, a successful auto-join authorizes Paul's stable Zoom account automatically; the returned one-use phrase remains a fallback when Zoom omits the stable account ID. Events without Zoom links, declined/cancelled events, and all-day blocks are ignored.
 
-The scheduler job should deliver only successful joins and actionable failures to Paul's trusted control channel. The deterministic monitor emits `candidate: null` while idle; when that baseline first wakes the agent, the agent must return `[SILENT]`. This companion covers the authenticated primary Google Calendar only; it does not imply access to separate Google accounts or non-Zoom conference providers.
+The scheduler job should keep successful trusted-account joins silent and deliver only pairing-required joins or actionable failures to Paul's trusted control channel. The deterministic monitor emits `candidate: null` while idle; when that baseline first wakes the agent, the agent must return `[SILENT]`. This companion covers the authenticated primary Google Calendar only; it does not imply access to separate Google accounts or non-Zoom conference providers.
 
 While a meeting is active, `zoom_chat_status` reports the 20 most recent finalized transcript segments and whether each matched the trusted operator's voice wake phrase. The full transcript diagnostic stays in memory and clears on leave. To diagnose missed wakes after a call, the plugin persists at most 50 finalized utterances from the trusted operator only, with relative time, parser outcome, and match status, in a mode-`0600` profile state file. It retains that bounded log after leave and clears it after the next successful join. It never persists other speakers' utterances in this diagnostic log.
 
@@ -136,7 +136,7 @@ An uncertain create or leave is stored under the active Hermes profile and block
 
 Only post-admission trusted-operator events reach Hermes. Those events opt into Hermes's normal gateway-control path so approvals, clarification replies, and other native controls work as they do in Slack. Pre-pair, wrong-identity, and missing-stable-identity events do not dispatch. The adapter does not invent a Zoom-specific tool or context policy; profile configuration supplies the same toolsets as Slack.
 
-Public admission is fail closed: the event must be addressed to `everyone`, come from the current participant ID bound to the trusted stable Zoom account (or the one-use fallback pairing), and start with an anchored Hio invocation. Names and host status never grant access. Public and private replies have separate exact destination mappings, so a failed send cannot fall back across audiences.
+Public admission is fail closed: the event must come from the current participant ID bound to the trusted stable Zoom account (or the one-use fallback pairing), start with an anchored Hio invocation, and be addressed to `everyone` or use Recall's native-mention `only_bot` encoding. Names and host status never grant access. Public and private replies have separate exact destination mappings, so a failed send cannot fall back across audiences.
 
 Recall receives the meeting URL and processes live meeting speech for transcription. The bot payload sets `recording_config.retention: null` and disables audio/video artifact fields, so Recall does not retain transcript or media artifacts under that configuration; this does not make claims about Recall operational metadata.
 
